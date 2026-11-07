@@ -1,0 +1,134 @@
+import 'dart:async';
+
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:flutter/foundation.dart';
+
+import '../../../core/platform/system_media_controls.dart';
+import 'playback_session.dart';
+import 'playback_system_media_controller.dart';
+
+final playbackManagerProvider = Provider<PlaybackManager?>((ref) => null);
+
+/// Owns one independent session per open playback page. Single-page navigation
+/// suspends other sessions without replacing their source or user intent.
+final class PlaybackManager extends ChangeNotifier {
+  PlaybackManager({
+    required this._createSession,
+    SystemMediaControls? systemMediaControls,
+  }) {
+    if (systemMediaControls != null) {
+      _systemMedia = PlaybackSystemMediaController(this, systemMediaControls);
+    }
+  }
+
+  PlaybackSystemMediaController? _systemMedia;
+  Iterable<PlaybackSession> get sessions => _sessions.values;
+  PlaybackSession? get selectedSession => _sessions[_selectedTabId];
+
+  final PlaybackSession Function() _createSession;
+  final _sessions = <String, PlaybackSession>{};
+  final _releases = <Future<void>>{};
+  Future<void> _commands = Future.value();
+  bool _allowConcurrent = true;
+  bool _closed = false;
+  String? _activeTabId;
+  String? _selectedTabId;
+  int _revision = 0;
+
+  PlaybackSession acquire(String tabId) {
+    if (_closed) throw StateError('PlaybackManager is closed');
+    return _sessions.putIfAbsent(tabId, () {
+      final session = _createSession();
+      if (!_allowConcurrent) {
+        // Block autoplay immediately, including sources still being resolved.
+        unawaited(session.setPlaybackAllowed(false));
+      }
+      scheduleMicrotask(() {
+        if (_closed || !identical(_sessions[tabId], session)) return;
+        if (_activeTabId == tabId) _selectedTabId = tabId;
+        notifyListeners();
+        unawaited(_applyPolicy());
+      });
+      return session;
+    });
+  }
+
+  Future<void> updateWorkspace({
+    required bool allowConcurrent,
+    required String activeTabId,
+  }) {
+    if (_closed) return Future.value();
+    if (_allowConcurrent == allowConcurrent && _activeTabId == activeTabId) {
+      return _commands;
+    }
+    _allowConcurrent = allowConcurrent;
+    _activeTabId = activeTabId;
+    if (_sessions.containsKey(activeTabId)) _selectedTabId = activeTabId;
+    notifyListeners();
+    return _applyPolicy();
+  }
+
+  Future<void> _applyPolicy() {
+    final revision = ++_revision;
+    final blocked = <Future<void>>[
+      for (final entry in _sessions.entries)
+        if (!_allowConcurrent && entry.key != _selectedTabId)
+          entry.value.setPlaybackAllowed(false),
+    ];
+    final operation = _commands.then((_) async {
+      // Complete outgoing pauses before permitting another native engine.
+      await Future.wait(blocked);
+      if (_closed || revision != _revision) return;
+      await Future.wait([
+        for (final entry in _sessions.entries)
+          if (_allowConcurrent || entry.key == _selectedTabId)
+            entry.value.setPlaybackAllowed(true),
+      ]);
+    });
+    _commands = operation.then((_) {}, onError: (Object _, StackTrace _) {});
+    return operation;
+  }
+
+  void release(String tabId, PlaybackSession session) {
+    if (!identical(_sessions[tabId], session)) return;
+    _sessions.remove(tabId);
+    if (_selectedTabId == tabId) _selectedTabId = null;
+    notifyListeners();
+    final closing = session.close();
+    _releases.add(closing);
+    unawaited(closing.whenComplete(() => _releases.remove(closing)));
+  }
+
+  /// Waits for unmounted pages' native engines, leaving retained sessions alone.
+  Future<void> drainReleases() async {
+    await Future.wait(_releases.toList());
+  }
+
+  Future<void> stop() async {
+    ++_revision;
+    _systemMedia?.clear();
+    await Future.wait([for (final session in _sessions.values) session.stop()]);
+  }
+
+  Future<void> close() async {
+    if (_closed) return;
+    _closed = true;
+    ++_revision;
+    final sessions = _sessions.values.toList();
+    try {
+      final systemMedia = _systemMedia;
+      if (systemMedia != null) await systemMedia.close();
+    } finally {
+      _sessions.clear();
+      try {
+        await _commands;
+        await Future.wait([
+          ..._releases,
+          for (final session in sessions) session.close(),
+        ]);
+      } finally {
+        super.dispose();
+      }
+    }
+  }
+}

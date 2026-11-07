@@ -1,0 +1,1683 @@
+import 'dart:async';
+
+import 'package:bilisail/domain/app_failure.dart';
+import 'package:bilisail/domain/request_cancellation.dart';
+import 'package:bilisail/domain/user.dart';
+import 'package:bilisail/features/auth/application/auth_controller.dart';
+import 'package:bilisail/features/auth/domain/auth_repository.dart';
+import 'package:bilisail/features/live/application/live_controller.dart';
+import 'package:bilisail/features/live/domain/live_repository.dart';
+import 'package:bilisail/features/live/domain/live_chat_repository.dart';
+import 'package:bilisail/features/live/domain/live_room.dart';
+import 'package:bilisail/features/live/presentation/live_screen.dart';
+import 'package:bilisail/features/live/presentation/live_chat_bubble.dart';
+import 'package:bilisail/features/live/presentation/live_player_danmaku.dart';
+import 'package:bilisail/features/live/presentation/live_super_chat_card.dart';
+import 'package:bilisail/shared/ui/smooth_scroll_behavior.dart';
+import 'package:bilisail/shared/ui/paging_tab_strip.dart';
+import 'package:flutter/gestures.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:flutter_test/flutter_test.dart';
+
+const room = LiveRoom(
+  id: RoomId('12'),
+  title: '直播间标题',
+  anchorName: '主播甲',
+  anchorId: UserId('123'),
+  description: '这里是完整的直播间简介',
+  isLive: true,
+  popularity: 34000,
+);
+const superChats = [
+  LiveSuperChatMessage(
+    id: 'sc-1',
+    userName: '观众甲',
+    userId: UserId('456'),
+    text: '第一条完整的 SC 内容',
+    price: 50,
+  ),
+  LiveSuperChatMessage(
+    id: 'sc-2',
+    userName: '观众乙',
+    text: '第二条完整的 SC 内容',
+    price: 100,
+  ),
+];
+
+void main() {
+  late _Repository repository;
+  late _RealtimeRepository realtime;
+  late ProviderContainer container;
+
+  setUp(() {
+    repository = _Repository();
+    realtime = _RealtimeRepository();
+    container = ProviderContainer(
+      overrides: [
+        liveRepositoryProvider.overrideWithValue(repository),
+        liveChatRepositoryProvider.overrideWithValue(realtime),
+        authRepositoryProvider.overrideWithValue(_AuthRepository()),
+      ],
+    );
+  });
+
+  tearDown(() async {
+    container.dispose();
+    await realtime.events.close();
+  });
+
+  Future<void> showPage(
+    WidgetTester tester, {
+    double width = 1280,
+    double height = 800,
+    double textScale = 1,
+    LivePlayerBuilder? playerBuilder,
+    ValueChanged<UserId>? onOpenUser,
+    bool disableAnimations = false,
+    String roomId = '12',
+  }) async {
+    await tester.binding.setSurfaceSize(Size(width, height));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    await tester.pumpWidget(
+      UncontrolledProviderScope(
+        container: container,
+        child: MaterialApp(
+          theme: ThemeData(platform: TargetPlatform.windows),
+          scrollBehavior: const SmoothScrollBehavior(),
+          home: MediaQuery(
+            data: MediaQueryData(
+              textScaler: TextScaler.linear(textScale),
+              disableAnimations: disableAnimations,
+            ),
+            child: Scaffold(
+              body: LiveScreen(
+                roomId: roomId,
+                onOpenUser: onOpenUser,
+                playerBuilder: playerBuilder ?? (_, _) => const _PlayerProbe(),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.pump();
+    await tester.pump();
+  }
+
+  ScrollPosition chatPosition(WidgetTester tester) {
+    final scrollable = find.descendant(
+      of: find.byKey(const ValueKey('live-chat-list')),
+      matching: find.byType(Scrollable),
+    );
+    return tester.state<ScrollableState>(scrollable).position;
+  }
+
+  void receiveMessages(int start, int count) {
+    realtime.events.add([
+      for (var index = start; index < start + count; index++)
+        LiveChatReceived(
+          LiveChatMessage(
+            userName: '观众',
+            text: '新消息 $index ${'较长的换行内容' * (index % 12)}',
+          ),
+        ),
+    ]);
+  }
+
+  testWidgets('sidebar toggle follows the live split layout breakpoint', (
+    tester,
+  ) async {
+    await showPage(tester, width: 390);
+    await tester.pumpAndSettle();
+    final player = tester.state(find.byType(_PlayerProbe));
+    expect(find.byTooltip('收起直播信息'), findsNothing);
+    expect(find.byKey(const ValueKey('live-chat-list')), findsOneWidget);
+    for (final width in [899.0, 900.0, 1280.0, 390.0, 900.0]) {
+      await tester.binding.setSurfaceSize(Size(width, 800));
+      await tester.pumpAndSettle();
+      expect(
+        find.byTooltip('收起直播信息'),
+        width >= 900 ? findsOneWidget : findsNothing,
+      );
+      expect(find.byKey(const ValueKey('live-chat-list')), findsOneWidget);
+      expect(tester.state(find.byType(_PlayerProbe)), same(player));
+    }
+    await tester.tap(find.byTooltip('收起直播信息'));
+    await tester.pumpAndSettle();
+    expect(find.byKey(const ValueKey('live-chat-list')), findsNothing);
+    await tester.binding.setSurfaceSize(const Size(899, 800));
+    await tester.pumpAndSettle();
+    expect(find.byTooltip('展开直播信息'), findsNothing);
+    await tester.binding.setSurfaceSize(const Size(900, 800));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byTooltip('展开直播信息'));
+    await tester.pumpAndSettle();
+    expect(find.byKey(const ValueKey('live-chat-list')), findsOneWidget);
+    expect(tester.state(find.byType(_PlayerProbe)), same(player));
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('chat and audience updates retain player and unrelated views', (
+    tester,
+  ) async {
+    var playerBuilds = 0;
+    await showPage(
+      tester,
+      playerBuilder: (_, _) {
+        playerBuilds++;
+        return const _PlayerProbe();
+      },
+    );
+    await tester.pumpAndSettle();
+    final player = tester.state(find.byType(_PlayerProbe));
+    final renderLayer = tester.renderObject(find.byType(_PlayerProbe));
+    final roomTitle = tester.widget(find.text(room.title));
+    final scBubble = tester.widget(find.byType(LiveSuperChatBubble).first);
+    final chatList = tester.widget(
+      find.byKey(const ValueKey('live-chat-list')),
+    );
+    final opens = realtime.opens;
+    playerBuilds = 0;
+
+    realtime.events.add(const [
+      LiveViewerCountChanged('42'),
+      LiveWatchedCountChanged('84'),
+    ]);
+    await tester.pump();
+    expect(find.text('当前42人在看'), findsOneWidget);
+    expect(find.text('84人看过'), findsOneWidget);
+    expect(
+      tester.widget(find.byKey(const ValueKey('live-chat-list'))),
+      same(chatList),
+    );
+    expect(tester.widget(find.text(room.title)), same(roomTitle));
+    expect(
+      tester.widget(find.byType(LiveSuperChatBubble).first),
+      same(scBubble),
+    );
+    expect(playerBuilds, 0);
+
+    for (var index = 0; index < 20; index++) {
+      receiveMessages(index, 1);
+      await tester.pump(const Duration(milliseconds: 16));
+    }
+    await tester.pumpAndSettle();
+    expect(
+      container.read(liveControllerProvider(room.id)).messages,
+      hasLength(21),
+    );
+    expect(tester.widget(find.text(room.title)), same(roomTitle));
+    expect(
+      tester.widget(find.byType(LiveSuperChatBubble).first),
+      same(scBubble),
+    );
+    expect(playerBuilds, 0);
+    expect(tester.state(find.byType(_PlayerProbe)), same(player));
+    expect(tester.renderObject(find.byType(_PlayerProbe)), same(renderLayer));
+    expect(realtime.opens, opens);
+    expect(realtime.reads.single.isCancelled, false);
+
+    await tester.tap(find.byTooltip('收起直播信息'));
+    await tester.pumpAndSettle();
+    receiveMessages(30, 1);
+    await tester.pumpAndSettle();
+    expect(tester.state(find.byType(_PlayerProbe)), same(player));
+    expect(tester.renderObject(find.byType(_PlayerProbe)), same(renderLayer));
+    expect(playerBuilds, 0);
+    expect(realtime.opens, opens);
+    expect(realtime.reads.single.isCancelled, false);
+    await tester.tap(find.byTooltip('展开直播信息'));
+    await tester.pumpAndSettle();
+    expect(chatPosition(tester).extentAfter, lessThanOrEqualTo(1));
+    expect(playerBuilds, 0);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets(
+    'room status immediately replaces the player and closes realtime',
+    (tester) async {
+      var playerBuilds = 0;
+      await showPage(
+        tester,
+        playerBuilder: (_, _) {
+          playerBuilds++;
+          return const _PlayerProbe();
+        },
+      );
+      await tester.pumpAndSettle();
+      playerBuilds = 0;
+      realtime.events.add(const [LiveRoomStatusChanged(true)]);
+      await tester.pump();
+      expect(playerBuilds, 0);
+      realtime.events.add(const [LiveRoomStatusChanged(false)]);
+      expect(realtime.reads.single.isCancelled, true);
+      await tester.pumpAndSettle();
+      expect(find.byType(_PlayerProbe), findsNothing);
+      expect(find.text('主播尚未开播'), findsWidgets);
+      expect(playerBuilds, 0);
+      await container.read(liveControllerProvider(room.id).notifier).load();
+      await tester.pumpAndSettle();
+      expect(find.byType(_PlayerProbe), findsOneWidget);
+      expect(playerBuilds, 1);
+      expect(realtime.opens, 2);
+    },
+  );
+
+  testWidgets('cached live player still receives inherited theme updates', (
+    tester,
+  ) async {
+    final primary = ValueNotifier<Color>(Colors.blue);
+    addTearDown(primary.dispose);
+    final page = LiveScreen(
+      roomId: '12',
+      playerBuilder: (context, _) => Text(
+        'player-theme',
+        style: TextStyle(color: Theme.of(context).colorScheme.primary),
+      ),
+    );
+    await tester.pumpWidget(
+      UncontrolledProviderScope(
+        container: container,
+        child: ValueListenableBuilder<Color>(
+          valueListenable: primary,
+          builder: (_, color, _) => MaterialApp(
+            theme: ThemeData(colorScheme: ColorScheme.light(primary: color)),
+            home: Scaffold(body: page),
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(
+      tester.widget<Text>(find.text('player-theme')).style?.color,
+      Colors.blue,
+    );
+    primary.value = Colors.red;
+    await tester.pumpAndSettle();
+    expect(
+      tester.widget<Text>(find.text('player-theme')).style?.color,
+      Colors.red,
+    );
+    expect(realtime.opens, 1);
+    expect(realtime.reads.single.isCancelled, false);
+    expect(tester.takeException(), isNull);
+  });
+
+  for (final dimensions in [const Size(390, 844), const Size(844, 390)]) {
+    testWidgets(
+      'live keyboard resize retains player, draft and connection at $dimensions',
+      (tester) async {
+        tester.view.devicePixelRatio = 1;
+        tester.view.physicalSize = dimensions;
+        addTearDown(tester.view.resetPhysicalSize);
+        addTearDown(tester.view.resetDevicePixelRatio);
+        addTearDown(tester.view.resetViewInsets);
+        repository.scMessages = const [];
+        final editor = TextEditingController(text: '直播草稿');
+        addTearDown(editor.dispose);
+        var playerBuilds = 0;
+        await tester.pumpWidget(
+          UncontrolledProviderScope(
+            container: container,
+            child: MaterialApp(
+              home: Scaffold(
+                body: LiveScreen(
+                  roomId: '12',
+                  playerBuilder: (_, _) {
+                    playerBuilds++;
+                    return SizedBox.expand(
+                      key: const Key('keyboard-player'),
+                      child: Align(
+                        alignment: Alignment.bottomCenter,
+                        child: TextField(
+                          key: const Key('keyboard-editor'),
+                          controller: editor,
+                        ),
+                      ),
+                    );
+                  },
+                ),
+              ),
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+        await tester.tap(find.byKey(const Key('keyboard-editor')));
+        await tester.pumpAndSettle();
+        final focus = FocusManager.instance.primaryFocus;
+        final opens = realtime.opens;
+        playerBuilds = 0;
+        final maxInset = dimensions.width < dimensions.height ? 320.0 : 150.0;
+        for (final inset in [maxInset / 2, maxInset, maxInset / 2, 0.0]) {
+          tester.view.viewInsets = FakeViewPadding(bottom: inset);
+          await tester.pump();
+          expect(playerBuilds, 0);
+          expect(editor.text, '直播草稿');
+          expect(FocusManager.instance.primaryFocus, same(focus));
+          expect(realtime.opens, opens);
+        }
+        expect(tester.takeException(), isNull);
+      },
+      variant: TargetPlatformVariant.only(TargetPlatform.android),
+    );
+  }
+
+  Future<void> wheelChat(WidgetTester tester, double delta) async {
+    await tester.sendEventToBinding(
+      PointerScrollEvent(
+        kind: PointerDeviceKind.mouse,
+        position: tester.getCenter(
+          find.byKey(const ValueKey('live-chat-list')),
+        ),
+        scrollDelta: Offset(0, delta),
+      ),
+    );
+  }
+
+  for (final width in [390.0, 1280.0]) {
+    testWidgets('live chat and SC swipes retain scroll and player at $width', (
+      tester,
+    ) async {
+      repository.scMessages = List.generate(
+        20,
+        (index) => LiveSuperChatMessage(
+          id: 'sc-$index',
+          userName: 'SC 观众 $index',
+          text: '付费留言 $index',
+          price: 50,
+        ),
+      );
+      repository.chatMessages = List.generate(
+        80,
+        (index) => LiveChatMessage(userName: '观众', text: '历史消息 $index'),
+      );
+      await showPage(tester, width: width);
+      await tester.pumpAndSettle();
+      final player = tester.state(find.byType(_PlayerProbe));
+      final playerRect = tester.getRect(find.byType(_PlayerProbe));
+      final chat = find.byKey(const ValueKey('live-chat-list'));
+      final position = chatPosition(tester);
+      await tester.drag(chat, const Offset(0, 240));
+      await tester.pumpAndSettle();
+      final offset = position.pixels;
+      final pager = find.byKey(const ValueKey('live-info-swipe'));
+      final pageWidth = tester.getSize(pager).width;
+      final drag = await tester.startGesture(tester.getCenter(chat));
+      await drag.moveBy(Offset(-pageWidth * .3, 0));
+      await tester.pump();
+      await tester.pump();
+      final strip = tester.widget<PagingTabStrip<int>>(
+        find.byType(PagingTabStrip<int>),
+      );
+      expect(strip.value, 0);
+      expect(strip.progress?.value, inExclusiveRange(0, 1));
+      expect(find.text('共 20 条 SC'), findsOneWidget);
+      expect(tester.getRect(find.byType(_PlayerProbe)), playerRect);
+      await drag.moveBy(Offset(-pageWidth * .35, 0));
+      await drag.up();
+      await tester.pumpAndSettle();
+      expect(find.text('共 20 条 SC').hitTestable(), findsOneWidget);
+      final scList = find
+          .descendant(of: pager, matching: find.byType(ListView))
+          .hitTestable();
+      final scScrollable = find.descendant(
+        of: scList,
+        matching: find.byType(Scrollable),
+      );
+      final scPosition = tester.state<ScrollableState>(scScrollable).position;
+      await tester.drag(scList, const Offset(0, -240));
+      await tester.pumpAndSettle();
+      final scOffset = scPosition.pixels;
+      expect(scOffset, greaterThan(0));
+      receiveMessages(0, 8);
+      await tester.pumpAndSettle();
+      await tester.drag(pager, Offset(pageWidth * .7, 0));
+      await tester.pumpAndSettle();
+      expect(chatPosition(tester), same(position));
+      expect(position.pixels, offset);
+      await tester.drag(pager, Offset(-pageWidth * .7, 0));
+      await tester.pumpAndSettle();
+      expect(
+        tester.state<ScrollableState>(scScrollable).position,
+        same(scPosition),
+      );
+      expect(scPosition.pixels, scOffset);
+      expect(tester.state(find.byType(_PlayerProbe)), same(player));
+      expect(realtime.opens, 1);
+      expect(tester.takeException(), isNull);
+    });
+  }
+
+  testWidgets(
+    'opening chat follows variable-height messages and bounded batches',
+    (tester) async {
+      repository.chatMessages = List.generate(
+        LiveController.maxChatMessages,
+        (index) => LiveChatMessage(
+          userName: '观众',
+          text: '历史消息 $index ${'换行内容' * (index % 15)}',
+        ),
+      );
+      await showPage(tester);
+      await tester.pumpAndSettle();
+      final position = chatPosition(tester);
+      expect(position.maxScrollExtent, greaterThan(0));
+      expect(position.extentAfter, 0);
+
+      for (var batch = 0; batch < 4; batch++) {
+        receiveMessages(batch * 15, 15);
+        await tester.pumpAndSettle();
+        expect(position.extentAfter, 0);
+        expect(
+          find.textContaining('新消息 ${batch * 15 + 14} ').hitTestable(),
+          findsOneWidget,
+        );
+      }
+      expect(
+        container.read(liveControllerProvider(room.id)).messages,
+        hasLength(LiveController.maxChatMessages),
+      );
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  testWidgets(
+    'bounded chat eviction preserves a scrolled message element and position',
+    (tester) async {
+      repository.chatMessages = List.generate(
+        500,
+        (index) =>
+            LiveChatMessage(id: '$index', userName: '观众', text: '保留消息 $index'),
+      );
+      await showPage(tester);
+      await tester.pumpAndSettle();
+      final list = find.byKey(const ValueKey('live-chat-list'));
+      await tester.drag(list, const Offset(0, 400));
+      await tester.pumpAndSettle();
+      final visible = find.byType(LiveChatBubble).hitTestable().first;
+      final bubble = tester.widget<LiveChatBubble>(visible);
+      final anchor = find.byKey(bubble.key!);
+      final element = tester.element(anchor);
+      final position = tester.getTopLeft(anchor);
+      realtime.events.add(const [
+        LiveChatReceived(
+          LiveChatMessage(id: 'new', userName: '观众', text: '最新消息'),
+        ),
+      ]);
+      await tester.pumpAndSettle();
+      expect(
+        container.read(liveControllerProvider(room.id)).messages,
+        hasLength(500),
+      );
+      expect(identical(tester.element(anchor), element), isTrue);
+      expect(tester.getTopLeft(anchor).dy, closeTo(position.dy, 1));
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  testWidgets('manual drag pauses following until dragged back to the bottom', (
+    tester,
+  ) async {
+    repository.chatMessages = List.generate(
+      60,
+      (index) => LiveChatMessage(userName: '观众', text: '历史消息 $index'),
+    );
+    await showPage(tester);
+    await tester.pumpAndSettle();
+    final chatList = find.byKey(const ValueKey('live-chat-list'));
+    final position = chatPosition(tester);
+    await tester.drag(chatList, const Offset(0, 240));
+    await tester.pumpAndSettle();
+    final before = position.pixels;
+    expect(position.extentAfter, greaterThan(48));
+    receiveMessages(0, 8);
+    await tester.pumpAndSettle();
+    expect(position.pixels, before);
+
+    await tester.drag(chatList, const Offset(0, -5000));
+    await tester.pumpAndSettle();
+    expect(position.extentAfter, 0);
+    receiveMessages(8, 8);
+    await tester.pumpAndSettle();
+    expect(position.extentAfter, 0);
+    expect(find.textContaining('新消息 15 ').hitTestable(), findsOneWidget);
+  });
+
+  testWidgets(
+    'paused chat retains its reading window after all live messages are evicted',
+    (tester) async {
+      repository.chatMessages = List.generate(
+        LiveController.maxChatMessages,
+        (index) => LiveChatMessage(
+          id: 'history-$index',
+          userName: '观众',
+          text: '保留消息 $index ${'换行内容' * (index % 15)}',
+        ),
+      );
+      await showPage(tester);
+      await tester.pumpAndSettle();
+      await wheelChat(tester, -240);
+      await tester.pumpAndSettle();
+      final position = chatPosition(tester);
+      final before = position.pixels;
+      final extent = position.maxScrollExtent;
+      final visible = find.byType(LiveChatBubble).hitTestable().first;
+      final bubble = tester.widget<LiveChatBubble>(visible);
+      final anchor = find.byKey(bubble.key!);
+      final element = tester.element(anchor);
+      final top = tester.getTopLeft(anchor).dy;
+
+      for (var batch = 0; batch < 4; batch++) {
+        if (batch == 1) {
+          realtime.events.add(const [
+            LiveConnectionChanged(LiveConnectionPhase.reconnecting),
+          ]);
+        }
+        receiveMessages(batch * 150, 150);
+        await tester.pumpAndSettle();
+        expect(tester.element(anchor), same(element));
+        expect(tester.getTopLeft(anchor).dy, closeTo(top, .1));
+        expect(position.pixels, before);
+        expect(position.maxScrollExtent, extent);
+        expect(
+          container.read(liveControllerProvider(room.id)).messages,
+          hasLength(LiveController.maxChatMessages),
+        );
+      }
+      expect(
+        container
+            .read(liveControllerProvider(room.id))
+            .messages
+            .any((message) => message.id == bubble.message.id),
+        isFalse,
+      );
+
+      await wheelChat(tester, 50000);
+      await tester.pumpAndSettle();
+      expect(position.extentAfter, 0);
+      expect(find.textContaining('新消息 599 ').hitTestable(), findsOneWidget);
+      receiveMessages(600, 3);
+      await tester.pumpAndSettle();
+      expect(position.extentAfter, 0);
+      expect(find.textContaining('新消息 602 ').hitTestable(), findsOneWidget);
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  testWidgets('downward wheel resumes a paused window that now fits', (
+    tester,
+  ) async {
+    repository.chatMessages = List.generate(
+      20,
+      (index) => LiveChatMessage(userName: '观众', text: '历史消息 $index'),
+    );
+    await showPage(tester, height: 450);
+    await tester.pumpAndSettle();
+    await wheelChat(tester, -120);
+    await tester.pumpAndSettle();
+    expect(chatPosition(tester).extentAfter, greaterThan(0));
+    receiveMessages(0, 100);
+    await tester.pumpAndSettle();
+    await tester.binding.setSurfaceSize(const Size(1280, 1600));
+    await tester.pumpAndSettle();
+    expect(chatPosition(tester).maxScrollExtent, 0);
+    expect(find.textContaining('新消息 99 '), findsNothing);
+
+    await wheelChat(tester, 120);
+    await tester.pumpAndSettle();
+    expect(chatPosition(tester).extentAfter, 0);
+    expect(find.textContaining('新消息 99 ').hitTestable(), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  for (final disableAnimations in [false, true]) {
+    testWidgets(
+      'manual wheel pauses even near bottom and resumes there (reduced motion: $disableAnimations)',
+      (tester) async {
+        repository.chatMessages = List.generate(
+          60,
+          (index) => LiveChatMessage(userName: '观众', text: '历史消息 $index'),
+        );
+        await showPage(tester, disableAnimations: disableAnimations);
+        await tester.pumpAndSettle();
+        final position = chatPosition(tester);
+        await wheelChat(tester, -24);
+        // A new batch can arrive before a smooth wheel's first animation frame.
+        receiveMessages(0, 2);
+        await tester.pumpAndSettle();
+        expect(position.extentAfter, greaterThan(0));
+        final before = position.pixels;
+        receiveMessages(2, 3);
+        await tester.pumpAndSettle();
+        expect(position.pixels, before);
+
+        await wheelChat(tester, 50000);
+        await tester.pumpAndSettle();
+        expect(position.extentAfter, 0);
+        // Scrolling just 24px up must also pause the old 48px heuristic.
+        await wheelChat(tester, -24);
+        await tester.pumpAndSettle();
+        final nearBottom = position.pixels;
+        expect(position.extentAfter, closeTo(24, .1));
+        receiveMessages(5, 3);
+        await tester.pumpAndSettle();
+        expect(position.pixels, nearBottom);
+        await wheelChat(tester, 50000);
+        await tester.pumpAndSettle();
+        receiveMessages(8, 5);
+        await tester.pumpAndSettle();
+        expect(position.extentAfter, 0);
+        expect(find.textContaining('新消息 12 ').hitTestable(), findsOneWidget);
+      },
+    );
+  }
+
+  testWidgets('following catches up after tabs, sidebar and viewport changes', (
+    tester,
+  ) async {
+    repository.chatMessages = List.generate(
+      80,
+      (index) => LiveChatMessage(userName: '观众', text: '历史消息 $index'),
+    );
+    await showPage(tester);
+    await tester.pumpAndSettle();
+    final position = chatPosition(tester);
+    final player = tester.state(find.byType(_PlayerProbe));
+    await tester.drag(
+      find.byKey(const ValueKey('live-info-swipe')),
+      const Offset(-260, 0),
+    );
+    receiveMessages(0, 12);
+    await tester.pumpAndSettle();
+    await tester.drag(
+      find.byKey(const ValueKey('live-info-swipe')),
+      const Offset(260, 0),
+    );
+    await tester.pumpAndSettle();
+    expect(position.extentAfter, 0);
+    await tester.tap(find.byTooltip('收起直播信息'));
+    receiveMessages(12, 12);
+    await tester.pumpAndSettle();
+    await tester.tap(find.byTooltip('展开直播信息'));
+    await tester.pumpAndSettle();
+    expect(position.extentAfter, 0);
+    await tester.binding.setSurfaceSize(const Size(1024, 520));
+    await tester.pumpAndSettle();
+    expect(position.extentAfter, 0);
+    expect(tester.state(find.byType(_PlayerProbe)), same(player));
+
+    await tester.tap(find.byKey(const ValueKey('live-sc-chip-sc-1')));
+    await tester.pumpAndSettle();
+    receiveMessages(24, 6);
+    await tester.pumpAndSettle();
+    expect(position.extentAfter, 0);
+    expect(
+      find.byKey(const ValueKey('live-sc-card-sc-1')).hitTestable(),
+      findsOneWidget,
+    );
+    await tester.tap(find.byKey(const ValueKey('live-sc-chip-sc-1')));
+    await tester.pumpAndSettle();
+    expect(position.extentAfter, 0);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('paused following survives sidebar, tab and viewport changes', (
+    tester,
+  ) async {
+    repository.chatMessages = List.generate(
+      80,
+      (index) => LiveChatMessage(userName: '观众', text: '历史消息 $index'),
+    );
+    await showPage(tester);
+    await tester.pumpAndSettle();
+    final position = chatPosition(tester);
+    await tester.drag(
+      find.byKey(const ValueKey('live-chat-list')),
+      const Offset(0, 240),
+    );
+    await tester.pumpAndSettle();
+    final before = position.pixels;
+    await tester.tap(find.byKey(const ValueKey('live-tab-1')));
+    receiveMessages(0, 8);
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const ValueKey('live-tab-0')));
+    await tester.pumpAndSettle();
+    expect(position.pixels, before);
+    await tester.tap(find.byTooltip('收起直播信息'));
+    receiveMessages(8, 8);
+    await tester.pumpAndSettle();
+    await tester.tap(find.byTooltip('展开直播信息'));
+    await tester.pumpAndSettle();
+    expect(position.pixels, before);
+    await tester.binding.setSurfaceSize(const Size(1024, 520));
+    await tester.pumpAndSettle();
+    expect(position.pixels, before);
+    receiveMessages(16, 8);
+    await tester.pumpAndSettle();
+    expect(position.pixels, before);
+    expect(position.extentAfter, greaterThan(0));
+  });
+
+  testWidgets('changing room resets paused following for the new room', (
+    tester,
+  ) async {
+    repository.chatMessages = List.generate(
+      80,
+      (index) => LiveChatMessage(userName: '观众', text: '历史消息 $index'),
+    );
+    await showPage(tester);
+    await tester.pumpAndSettle();
+    await tester.drag(
+      find.byKey(const ValueKey('live-chat-list')),
+      const Offset(0, 240),
+    );
+    await tester.pumpAndSettle();
+    expect(chatPosition(tester).extentAfter, greaterThan(0));
+    await showPage(tester, roomId: '13');
+    await tester.pumpAndSettle();
+    expect(chatPosition(tester).extentAfter, 0);
+    receiveMessages(0, 8);
+    await tester.pumpAndSettle();
+    expect(chatPosition(tester).extentAfter, 0);
+    expect(find.textContaining('新消息 7 ').hitTestable(), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('chat scrollbar drag pauses and restores following', (
+    tester,
+  ) async {
+    repository.chatMessages = List.generate(
+      80,
+      (index) => LiveChatMessage(userName: '观众', text: '历史消息 $index'),
+    );
+    await showPage(tester);
+    await tester.pumpAndSettle();
+    final chatList = find.byKey(const ValueKey('live-chat-list'));
+    final position = chatPosition(tester);
+    final rect = tester.getRect(chatList);
+    final mouse = await tester.createGesture(kind: PointerDeviceKind.mouse);
+    await mouse.addPointer(location: Offset(rect.right - 4, rect.bottom - 20));
+    await tester.pumpAndSettle();
+    Future<void> dragThumb(
+      double delta, {
+      Future<void> Function()? whileHeld,
+    }) async {
+      final thumbHeight =
+          (rect.height - 6) *
+          position.viewportDimension /
+          (position.maxScrollExtent + position.viewportDimension);
+      final fraction = position.pixels / position.maxScrollExtent;
+      final center = Offset(
+        rect.right - 4,
+        rect.top +
+            3 +
+            fraction * (rect.height - 6 - thumbHeight) +
+            thumbHeight / 2,
+      );
+      await mouse.moveTo(center);
+      await tester.pump();
+      await mouse.down(center);
+      await mouse.moveBy(Offset(0, delta));
+      if (whileHeld != null) await whileHeld();
+      await mouse.up();
+      await tester.pumpAndSettle();
+    }
+
+    await dragThumb(
+      -80,
+      whileHeld: () async {
+        await tester.pumpAndSettle();
+        final before = position.pixels;
+        final extent = position.maxScrollExtent;
+        // Scrollbar dragging temporarily ignores pointer hits in the viewport.
+        final bubble = tester
+            .widgetList<LiveChatBubble>(find.byType(LiveChatBubble))
+            .firstWhere(
+              (bubble) =>
+                  rect.contains(tester.getCenter(find.byKey(bubble.key!))),
+            );
+        final anchor = find.byKey(bubble.key!);
+        final top = tester.getTopLeft(anchor).dy;
+        receiveMessages(100, 600);
+        await tester.pumpAndSettle();
+        expect(position.pixels, before);
+        expect(position.maxScrollExtent, extent);
+        expect(tester.getTopLeft(anchor).dy, closeTo(top, .1));
+      },
+    );
+    expect(position.extentAfter, greaterThan(48));
+    final before = position.pixels;
+    receiveMessages(0, 8);
+    await tester.pumpAndSettle();
+    expect(position.pixels, before);
+    await dragThumb(rect.height);
+    expect(position.extentAfter, 0);
+    expect(find.textContaining('新消息 7 ').hitTestable(), findsOneWidget);
+    receiveMessages(8, 8);
+    await tester.pumpAndSettle();
+    expect(position.extentAfter, 0);
+    await mouse.removePointer();
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('reloading the room clears a paused reading window', (
+    tester,
+  ) async {
+    repository.chatMessages = List.generate(
+      80,
+      (index) => LiveChatMessage(userName: '观众', text: '旧消息 $index'),
+    );
+    await showPage(tester);
+    await tester.pumpAndSettle();
+    await wheelChat(tester, -240);
+    await tester.pumpAndSettle();
+    expect(chatPosition(tester).extentAfter, greaterThan(0));
+    repository.chatMessages = List.generate(
+      80,
+      (index) => LiveChatMessage(userName: '观众', text: '重载消息 $index'),
+    );
+    await container.read(liveControllerProvider(room.id).notifier).load();
+    await tester.pumpAndSettle();
+    expect(find.textContaining('旧消息'), findsNothing);
+    expect(find.textContaining('重载消息 79').hitTestable(), findsOneWidget);
+    expect(chatPosition(tester).extentAfter, 0);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('unmount stops realtime even when the controller stays alive', (
+    tester,
+  ) async {
+    await showPage(tester);
+    final subscription = container.listen(
+      liveControllerProvider(room.id),
+      (_, _) {},
+    );
+    addTearDown(subscription.close);
+    final controller = container.read(liveControllerProvider(room.id).notifier);
+    final messages = container.read(liveControllerProvider(room.id)).messages;
+    expect(realtime.events.hasListener, isTrue);
+    expect(realtime.reads.single.isCancelled, isFalse);
+
+    await tester.pumpWidget(
+      UncontrolledProviderScope(
+        container: container,
+        child: const MaterialApp(home: Text('replacement')),
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(controller.isMounted, isTrue);
+    expect(realtime.reads.single.isCancelled, isTrue);
+    expect(realtime.events.hasListener, isFalse);
+    expect(
+      container.read(liveControllerProvider(room.id)).connectionPhase,
+      LiveConnectionPhase.closed,
+    );
+    realtime.events.add(const [
+      LiveChatReceived(LiveChatMessage(userName: 'late', text: 'late event')),
+    ]);
+    await tester.pump(const Duration(seconds: 21));
+    expect(container.read(liveControllerProvider(room.id)).messages, messages);
+    expect(realtime.opens, 1);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets(
+    'anchor and chat names open the correct profile and description is removed',
+    (tester) async {
+      repository.chatMessages = const [
+        LiveChatMessage(
+          userName: '可点击观众',
+          userId: UserId('9007199254740993'),
+          text: '普通聊天消息',
+        ),
+        LiveChatMessage(userName: '无UID观众', text: '匿名消息'),
+      ];
+      final opened = <UserId>[];
+      await showPage(tester, onOpenUser: opened.add);
+      expect(find.text('展开简介'), findsNothing);
+      expect(find.text('收起简介'), findsNothing);
+      expect(find.text(room.description), findsNothing);
+      expect(find.byTooltip('查看主播主页'), findsNothing);
+      await tester.tap(find.byKey(const ValueKey('live-anchor-avatar')));
+      await tester.tap(find.byKey(const ValueKey('live-anchor-name')));
+      await tester.tap(find.text('可点击观众'));
+      await tester.tap(find.text('无UID观众'));
+      expect(opened, [
+        const UserId('123'),
+        const UserId('123'),
+        const UserId('9007199254740993'),
+      ]);
+
+      await tester.tap(find.byKey(const ValueKey('live-sc-chip-sc-1')));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('观众甲'));
+      expect(opened.last, const UserId('456'));
+    },
+  );
+
+  testWidgets(
+    'watched and current viewers update independently at the top right',
+    (tester) async {
+      await showPage(tester);
+      expect(find.text('在看人数暂无数据'), findsOneWidget);
+      expect(find.text('看过人数暂无数据'), findsOneWidget);
+      expect(find.text('当前34000人在看'), findsNothing);
+      expect(find.text('人气 3.4万'), findsOneWidget);
+      final player = tester.state(find.byType(_PlayerProbe));
+      realtime.events.add(const [LiveWatchedCountChanged('8.6万')]);
+      await tester.pump();
+      expect(find.text('8.6万人看过'), findsOneWidget);
+      expect(find.text('在看人数暂无数据'), findsOneWidget);
+      expect(find.text('当前8.6万人在看'), findsNothing);
+      realtime.events.add(const [
+        LiveViewerCountChanged('2.3万'),
+        LivePopularityChanged(1),
+      ]);
+      await tester.pump();
+      expect(find.text('当前2.3万人在看'), findsOneWidget);
+      expect(find.text('8.6万人看过'), findsOneWidget);
+      expect(find.text('人气 3.4万'), findsOneWidget);
+      expect(find.text('人气 1'), findsNothing);
+      expect(
+        tester.getTopLeft(find.byKey(const ValueKey('live-viewer-count'))).dx,
+        greaterThan(
+          tester
+              .getTopRight(find.byKey(const ValueKey('live-anchor-avatar')))
+              .dx,
+        ),
+      );
+      expect(tester.state(find.byType(_PlayerProbe)), same(player));
+      realtime.events.add(const [LiveWatchedCountChanged('8.7万')]);
+      await tester.pump();
+      expect(find.text('当前2.3万人在看'), findsOneWidget);
+      expect(find.text('8.7万人看过'), findsOneWidget);
+      expect(
+        tester.getTopLeft(find.byKey(const ValueKey('live-watched-count'))).dx,
+        greaterThan(
+          tester
+              .getTopRight(find.byKey(const ValueKey('live-anchor-avatar')))
+              .dx,
+        ),
+      );
+      realtime.events.add(const [LiveViewerCountChanged('0')]);
+      await tester.pump();
+      expect(find.text('当前0人在看'), findsOneWidget);
+      expect(find.text('8.7万人看过'), findsOneWidget);
+      realtime.events.add(const [LiveWatchedCountChanged('0')]);
+      await tester.pump();
+      expect(find.text('0人看过'), findsOneWidget);
+      expect(find.text('当前0人在看'), findsOneWidget);
+      expect(tester.state(find.byType(_PlayerProbe)), same(player));
+    },
+  );
+
+  testWidgets('chat bubbles expand one SC and tab shows the same full cards', (
+    tester,
+  ) async {
+    await showPage(tester);
+    expect(find.text('历史消息 · 定时刷新'), findsOneWidget);
+    expect(find.text('SC (2)'), findsOneWidget);
+    expect(find.byKey(const ValueKey('live-sc-chip-sc-1')), findsOneWidget);
+
+    final player = tester.state(find.byType(_PlayerProbe));
+    await tester.tap(find.byKey(const ValueKey('live-sc-chip-sc-1')));
+    await tester.pumpAndSettle();
+    expect(find.text('第一条完整的 SC 内容'), findsOneWidget);
+    await tester.tap(find.byKey(const ValueKey('live-sc-chip-sc-2')));
+    await tester.pumpAndSettle();
+    expect(find.text('第一条完整的 SC 内容'), findsNothing);
+    expect(find.text('第二条完整的 SC 内容'), findsOneWidget);
+    expect(find.text('关闭 SC 详情'), findsNothing);
+    await tester.tap(find.byKey(const ValueKey('live-sc-chip-sc-2')));
+    await tester.pumpAndSettle();
+    expect(find.text('第二条完整的 SC 内容'), findsNothing);
+
+    await tester.tap(find.byKey(const ValueKey('live-tab-1')));
+    await tester.pumpAndSettle();
+    expect(find.text('共 2 条 SC'), findsOneWidget);
+    expect(find.text('第一条完整的 SC 内容'), findsOneWidget);
+    expect(find.text('第二条完整的 SC 内容'), findsOneWidget);
+    expect(tester.state(find.byType(_PlayerProbe)), same(player));
+
+    await tester.tap(find.byTooltip('收起直播信息'));
+    await tester.pump();
+    expect(tester.state(find.byType(_PlayerProbe)), same(player));
+    await tester.tap(find.byTooltip('展开直播信息'));
+    await tester.pump();
+    expect(find.text('共 2 条 SC'), findsOneWidget);
+    expect(tester.state(find.byType(_PlayerProbe)), same(player));
+  });
+
+  testWidgets(
+    'SC stays visible while reading chat and reopens with one click',
+    (tester) async {
+      repository.chatMessages = List.generate(
+        80,
+        (index) => LiveChatMessage(userName: '观众', text: '聊天消息 $index'),
+      );
+      await showPage(tester);
+      await tester.pumpAndSettle();
+      final bubble = find.byKey(const ValueKey('live-sc-chip-sc-1'));
+      final card = find.byKey(const ValueKey('live-sc-card-sc-1'));
+      await tester.tap(bubble);
+      await tester.pumpAndSettle();
+      expect(card.hitTestable(), findsOneWidget);
+
+      await wheelChat(tester, -600);
+      await tester.pumpAndSettle();
+      expect(chatPosition(tester).extentAfter, greaterThan(0));
+      expect(card.hitTestable(), findsOneWidget);
+      final offset = chatPosition(tester).pixels;
+      receiveMessages(0, 20);
+      await tester.pumpAndSettle();
+      expect(card.hitTestable(), findsOneWidget);
+      expect(chatPosition(tester).pixels, offset);
+
+      await tester.tap(bubble);
+      await tester.pumpAndSettle();
+      expect(card, findsNothing);
+      expect(chatPosition(tester).pixels, offset);
+
+      await tester.tap(bubble);
+      await tester.pumpAndSettle();
+      expect(card.hitTestable(), findsOneWidget);
+      expect(chatPosition(tester).pixels, offset);
+    },
+  );
+
+  for (final disableAnimations in [false, true]) {
+    testWidgets(
+      'SC opens and closes smoothly (reduced motion: $disableAnimations)',
+      (tester) async {
+        await showPage(tester, disableAnimations: disableAnimations);
+        await tester.pumpAndSettle();
+        final details = find.byKey(const ValueKey('live-sc-details'));
+        final bubble = find.byKey(const ValueKey('live-sc-chip-sc-1'));
+        final card = find.byKey(const ValueKey('live-sc-card-sc-1'));
+        final player = tester.state(find.byType(_PlayerProbe));
+        expect(tester.getSize(details).height, 0);
+
+        await tester.tap(bubble);
+        await tester.pump();
+        await tester.pump(const Duration(milliseconds: 50));
+        final openingHeight = tester.getSize(details).height;
+        expect(openingHeight, greaterThan(0));
+        await tester.pumpAndSettle();
+        final expandedHeight = tester.getSize(details).height;
+        expect(
+          openingHeight,
+          disableAnimations ? expandedHeight : lessThan(expandedHeight),
+        );
+        expect(card.hitTestable(), findsOneWidget);
+
+        await tester.tap(bubble);
+        await tester.pump();
+        await tester.pump(const Duration(milliseconds: 50));
+        final closingHeight = tester.getSize(details).height;
+        if (disableAnimations) {
+          expect(closingHeight, 0);
+        } else {
+          expect(closingHeight, inExclusiveRange(0, expandedHeight));
+          expect(card.hitTestable(), findsNothing);
+        }
+        await tester.pumpAndSettle();
+        expect(tester.getSize(details).height, 0);
+        expect(card, findsNothing);
+        expect(tester.state(find.byType(_PlayerProbe)), same(player));
+      },
+    );
+
+    testWidgets(
+      'overflow SC supports wheel and bottom thumb (reduced motion: $disableAnimations)',
+      (tester) async {
+        repository.scMessages = List.generate(
+          14,
+          (index) => LiveSuperChatMessage(
+            id: 'overflow-$index',
+            userName: '观众 $index',
+            text: 'SC 留言 $index',
+            price: 1000,
+          ),
+        );
+        await showPage(tester, disableAnimations: disableAnimations);
+        final bar = find.byKey(const ValueKey('live-sc-scrollbar'));
+        final bubbleList = find.descendant(
+          of: bar,
+          matching: find.byType(ListView),
+        );
+        final scrollable = find.descendant(
+          of: bubbleList,
+          matching: find.byType(Scrollable),
+        );
+        final position = tester.state<ScrollableState>(scrollable).position;
+        final player = tester.state(find.byType(_PlayerProbe));
+        Future<void> wheel(Offset delta) async {
+          await tester.sendEventToBinding(
+            PointerScrollEvent(
+              kind: PointerDeviceKind.mouse,
+              position: tester.getCenter(bubbleList),
+              scrollDelta: delta,
+            ),
+          );
+          await tester.pumpAndSettle();
+        }
+
+        await wheel(const Offset(0, 120));
+        expect(position.pixels, closeTo(120, .01));
+        await wheel(const Offset(40, 200));
+        expect(position.pixels, closeTo(160, .01));
+        await wheel(const Offset(0, 5000));
+        expect(position.pixels, position.maxScrollExtent);
+        final lastBubble = find.byKey(
+          const ValueKey('live-sc-chip-overflow-13'),
+        );
+        expect(lastBubble.hitTestable(), findsOneWidget);
+        await tester.tap(lastBubble);
+        await tester.pumpAndSettle();
+        expect(find.text('SC 留言 13'), findsOneWidget);
+        await tester.tap(lastBubble);
+        await tester.pumpAndSettle();
+        expect(find.text('SC 留言 13'), findsNothing);
+
+        await wheel(const Offset(0, -5000));
+        expect(position.pixels, 0);
+        final rect = tester.getRect(bar);
+        final thumbWidth =
+            rect.width *
+            position.viewportDimension /
+            (position.maxScrollExtent + position.viewportDimension);
+        final mouse = await tester.createGesture(kind: PointerDeviceKind.mouse);
+        await mouse.down(Offset(rect.left + thumbWidth / 2, rect.bottom - 2));
+        await mouse.moveBy(const Offset(90, 0));
+        await mouse.up();
+        await tester.pumpAndSettle();
+        expect(position.pixels, greaterThan(120));
+        final before = position.pixels;
+        await tester.tap(find.byTooltip('收起直播信息'));
+        await tester.pump();
+        await tester.tap(find.byTooltip('展开直播信息'));
+        await tester.pump();
+        expect(position.pixels, before);
+        expect(tester.state(find.byType(_PlayerProbe)), same(player));
+        expect(tester.takeException(), isNull);
+      },
+    );
+  }
+
+  testWidgets('rapid SC changes settle on the latest selection', (
+    tester,
+  ) async {
+    await showPage(tester);
+    final first = find.byKey(const ValueKey('live-sc-chip-sc-1'));
+    final second = find.byKey(const ValueKey('live-sc-chip-sc-2'));
+    for (final bubble in [first, second, second, first]) {
+      await tester.tap(bubble);
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 40));
+    }
+    await tester.pumpAndSettle();
+    expect(find.text('第一条完整的 SC 内容').hitTestable(), findsOneWidget);
+    expect(find.text('第二条完整的 SC 内容'), findsNothing);
+    expect(tester.widget<LiveSuperChatBubble>(first).selected, isTrue);
+    expect(tester.widget<LiveSuperChatBubble>(second).selected, isFalse);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('long SC scrolls independently in a narrow large-text sidebar', (
+    tester,
+  ) async {
+    repository.scMessages = [
+      LiveSuperChatMessage(
+        id: 'long',
+        userName: '观众',
+        text: List.generate(40, (index) => '长留言第 $index 行').join('\n'),
+        price: 30,
+      ),
+    ];
+    await showPage(tester, width: 320, height: 740, textScale: 2);
+    await tester.tap(find.byKey(const ValueKey('live-sc-chip-long')));
+    await tester.pumpAndSettle();
+    final details = find.byKey(const ValueKey('live-sc-details'));
+    final list = find.byKey(const ValueKey('live-chat-list'));
+    expect(tester.getSize(details).height, greaterThan(0));
+    expect(
+      tester.getSize(list).height,
+      greaterThanOrEqualTo(tester.getSize(details).height - 1),
+    );
+    final scrollable = find.descendant(
+      of: details,
+      matching: find.byType(Scrollable),
+    );
+    final position = tester.state<ScrollableState>(scrollable).position;
+    final chatOffset = chatPosition(tester).pixels;
+    expect(position.maxScrollExtent, greaterThan(0));
+    await tester.drag(details, const Offset(0, -150));
+    await tester.pumpAndSettle();
+    expect(position.pixels, greaterThan(0));
+    expect(chatPosition(tester).pixels, chatOffset);
+    expect(tester.takeException(), isNull);
+
+    // The outgoing card must also respect a smaller viewport during collapse.
+    await tester.tap(find.byKey(const ValueKey('live-sc-chip-long')));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 40));
+    await tester.binding.setSurfaceSize(const Size(320, 500));
+    await tester.pump();
+    expect(tester.takeException(), isNull);
+    await tester.pumpAndSettle();
+    expect(tester.getSize(details).height, 0);
+  });
+
+  testWidgets('320 px with large text keeps chat and SC reachable', (
+    tester,
+  ) async {
+    await showPage(tester, width: 320, height: 740, textScale: 2);
+    realtime.events.add(const [
+      LiveViewerCountChanged('2.3万'),
+      LiveWatchedCountChanged('123.4万'),
+    ]);
+    await tester.pump();
+    expect(find.text('当前2.3万人在看'), findsOneWidget);
+    expect(find.text('123.4万人看过'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+    expect(find.byKey(const ValueKey('live-tab-0')), findsOneWidget);
+    await tester.tap(find.byKey(const ValueKey('live-sc-chip-sc-1')));
+    await tester.pump();
+    expect(find.text('第一条完整的 SC 内容'), findsOneWidget);
+    await tester.tap(find.byKey(const ValueKey('live-tab-1')));
+    await tester.pumpAndSettle();
+    expect(find.text('共 2 条 SC'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('collapsing the sidebar keeps chat scroll position', (
+    tester,
+  ) async {
+    repository.chatMessages = List.generate(
+      60,
+      (index) => LiveChatMessage(userName: '观众', text: '聊天消息 $index'),
+    );
+    await showPage(tester);
+    final chatList = find.byKey(const ValueKey('live-chat-list'));
+    await tester.drag(chatList, const Offset(0, 280));
+    await tester.pump();
+    final scrollable = find.descendant(
+      of: chatList,
+      matching: find.byType(Scrollable),
+    );
+    final before = tester.state<ScrollableState>(scrollable).position.pixels;
+    expect(before, greaterThan(0));
+
+    await tester.tap(find.byTooltip('收起直播信息'));
+    await tester.pump();
+    await tester.tap(find.byTooltip('展开直播信息'));
+    await tester.pump();
+    final after = tester.state<ScrollableState>(scrollable).position.pixels;
+    expect(after, before);
+
+    await tester.tap(find.byKey(const ValueKey('live-sc-chip-sc-1')));
+    await tester.pumpAndSettle();
+    expect(tester.state<ScrollableState>(scrollable).position.pixels, before);
+    expect(
+      find.byKey(const ValueKey('live-sc-card-sc-1')).hitTestable(),
+      findsOneWidget,
+    );
+  });
+
+  testWidgets(
+    'SC expiry removes its bubble and expanded card while retaining player',
+    (tester) async {
+      var now = DateTime.utc(2026, 10, 7);
+      container.dispose();
+      container = ProviderContainer(
+        overrides: [
+          liveRepositoryProvider.overrideWithValue(repository),
+          liveChatRepositoryProvider.overrideWithValue(realtime),
+          authRepositoryProvider.overrideWithValue(_AuthRepository()),
+          liveClockProvider.overrideWithValue(() => now),
+        ],
+      );
+      repository.scMessages = [
+        LiveSuperChatMessage(
+          id: 'timed',
+          userName: '观众',
+          text: '即将到期',
+          price: 30,
+          expiresAt: now.add(const Duration(seconds: 3)),
+        ),
+      ];
+      await showPage(tester);
+      final player = tester.state(find.byType(_PlayerProbe));
+      await tester.tap(find.byKey(const ValueKey('live-sc-chip-timed')));
+      await tester.pump();
+      expect(find.text('即将到期'), findsOneWidget);
+      expect(find.text('3s'), findsNWidgets(2));
+      now = now.add(const Duration(seconds: 3));
+      await tester.pump(const Duration(seconds: 3));
+      await tester.pumpAndSettle();
+      expect(find.byKey(const ValueKey('live-sc-chip-timed')), findsNothing);
+      expect(find.byKey(const ValueKey('live-sc-card-timed')), findsNothing);
+      expect(find.text('SC (0)'), findsOneWidget);
+      expect(tester.state(find.byType(_PlayerProbe)), same(player));
+      await tester.tap(find.byKey(const ValueKey('live-tab-1')));
+      await tester.pumpAndSettle();
+      expect(find.text('暂无 SC'), findsOneWidget);
+      await tester.pumpWidget(const SizedBox.shrink());
+      container
+          .read(liveControllerProvider(const RoomId('12')).notifier)
+          .setActive(false);
+    },
+  );
+
+  testWidgets('SC failure is visible in both tabs instead of an empty state', (
+    tester,
+  ) async {
+    repository.superChatFailure = const AppFailure(
+      AppFailureKind.network,
+      'SC 暂时无法更新',
+    );
+    await showPage(tester);
+    expect(find.text('SC 暂时无法更新'), findsOneWidget);
+    await tester.tap(find.byKey(const ValueKey('live-tab-1')));
+    await tester.pump();
+    expect(find.text('SC 暂时无法更新'), findsOneWidget);
+    expect(find.text('暂无 SC'), findsNothing);
+  });
+
+  testWidgets('realtime status, explicit reconnect and background cleanup', (
+    tester,
+  ) async {
+    await showPage(tester);
+    expect(realtime.opens, 1);
+    realtime.events.add(const [
+      LiveConnectionChanged(LiveConnectionPhase.connected),
+      LiveChatReceived(LiveChatMessage(userName: '观众丙', text: '实时收到的消息')),
+    ]);
+    await tester.pump();
+    await tester.pump();
+    expect(find.text('实时弹幕已连接'), findsOneWidget);
+    expect(find.textContaining('实时收到的消息'), findsOneWidget);
+    realtime.events.add(const [
+      LiveConnectionChanged(LiveConnectionPhase.failed, message: '连接测试失败'),
+    ]);
+    await tester.pump();
+    expect(find.text('连接测试失败'), findsOneWidget);
+    await tester.tap(find.byTooltip('重新连接弹幕'));
+    await tester.pump();
+    expect(realtime.opens, 2);
+    expect(realtime.reads.first.isCancelled, isTrue);
+
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.hidden);
+    await tester.pump();
+    await tester.pump();
+    expect(realtime.reads.last.isCancelled, isTrue);
+    realtime.events.add(const [
+      LiveChatReceived(LiveChatMessage(userName: '观众丙', text: '后台旧连接消息')),
+    ]);
+    await tester.pump();
+    expect(find.textContaining('后台旧连接消息'), findsNothing);
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.inactive);
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+    await tester.pump();
+    await tester.pump();
+    expect(realtime.opens, 3);
+  });
+
+  testWidgets('connection notice joins chat after history and scrolls away', (
+    tester,
+  ) async {
+    repository.chatMessages = List.generate(
+      80,
+      (index) => LiveChatMessage(userName: '观众', text: '历史消息 $index'),
+    );
+    await showPage(tester);
+    await tester.pumpAndSettle();
+    final player = tester.state(find.byType(_PlayerProbe));
+    realtime.events.add(const [
+      LiveConnectionChanged(LiveConnectionPhase.connected),
+      LiveChatReceived(LiveChatMessage(userName: '观众', text: '连接后的第一条')),
+    ]);
+    await tester.pumpAndSettle();
+    final status = find.byKey(const ValueKey('live-chat-connection-status'));
+    final chatList = find.byKey(const ValueKey('live-chat-list'));
+    expect(
+      find.descendant(of: chatList, matching: status).hitTestable(),
+      findsOneWidget,
+    );
+    expect(find.text('实时弹幕已连接').hitTestable(), findsOneWidget);
+    expect(
+      tester.getRect(status).bottom,
+      lessThan(tester.getRect(find.textContaining('连接后的第一条')).top),
+    );
+
+    receiveMessages(0, 30);
+    await tester.pumpAndSettle();
+    expect(chatPosition(tester).extentAfter, 0);
+    expect(find.text('实时弹幕已连接').hitTestable(), findsNothing);
+    expect(find.textContaining('新消息 29 ').hitTestable(), findsOneWidget);
+    await tester.scrollUntilVisible(
+      status,
+      -200,
+      scrollable: find.descendant(
+        of: chatList,
+        matching: find.byType(Scrollable),
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(find.text('实时弹幕已连接').hitTestable(), findsOneWidget);
+    final before = chatPosition(tester).pixels;
+    receiveMessages(30, 5);
+    await tester.pumpAndSettle();
+    expect(chatPosition(tester).pixels, before);
+    expect(tester.state(find.byType(_PlayerProbe)), same(player));
+  });
+
+  testWidgets(
+    'connection notice expires with bounded messages and reconnects',
+    (tester) async {
+      repository.chatMessages = List.generate(
+        LiveController.maxChatMessages,
+        (index) => LiveChatMessage(userName: '观众', text: '历史消息 $index'),
+      );
+      await showPage(tester);
+      await tester.pumpAndSettle();
+      realtime.events.add(const [
+        LiveConnectionChanged(LiveConnectionPhase.connected),
+      ]);
+      await tester.pumpAndSettle();
+      expect(find.text('实时弹幕已连接').hitTestable(), findsOneWidget);
+      receiveMessages(0, LiveController.maxChatMessages);
+      await tester.pumpAndSettle();
+      expect(find.text('实时弹幕已连接'), findsNothing);
+      final list = tester.widget<ListView>(
+        find.byKey(const ValueKey('live-chat-list')),
+      );
+      expect(
+        list.childrenDelegate.estimatedChildCount,
+        LiveController.maxChatMessages,
+      );
+
+      realtime.events.add(const [
+        LiveViewerCountChanged('1.9万'),
+        LiveWatchedCountChanged('8.5万'),
+        LivePopularityChanged(90000),
+      ]);
+      await tester.pumpAndSettle();
+      expect(find.text('实时弹幕已连接'), findsNothing);
+      realtime.events.add(const [
+        LiveConnectionChanged(LiveConnectionPhase.reconnecting),
+      ]);
+      await tester.pumpAndSettle();
+      expect(find.text('实时弹幕重连中…').hitTestable(), findsOneWidget);
+      realtime.events.add(const [
+        LiveConnectionChanged(LiveConnectionPhase.connected),
+      ]);
+      await tester.pumpAndSettle();
+      expect(find.text('实时弹幕已连接').hitTestable(), findsOneWidget);
+      expect(find.text('实时弹幕重连中…'), findsNothing);
+      expect(chatPosition(tester).extentAfter, 0);
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  testWidgets('history refresh keeps connection notice before later chats', (
+    tester,
+  ) async {
+    await showPage(tester);
+    realtime.events.add(const [
+      LiveConnectionChanged(LiveConnectionPhase.connected),
+      LiveChatReceived(LiveChatMessage(userName: '观众', text: '稍后的聊天')),
+    ]);
+    await tester.pumpAndSettle();
+    repository.chatMessages = const [
+      LiveChatMessage(userName: '普通观众', text: '普通聊天消息', userId: UserId('123')),
+    ];
+    await container
+        .read(liveControllerProvider(room.id).notifier)
+        .refreshChat();
+    await tester.pumpAndSettle();
+    final status = find.byKey(const ValueKey('live-chat-connection-status'));
+    expect(find.text('实时弹幕已连接').hitTestable(), findsOneWidget);
+    expect(
+      tester.getRect(status).bottom,
+      lessThan(tester.getRect(find.textContaining('稍后的聊天')).top),
+    );
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('changing room resets connection notice in narrow layouts', (
+    tester,
+  ) async {
+    repository.chatMessages = const [];
+    await showPage(tester, width: 320, height: 640, textScale: 2);
+    realtime.events.add(const [
+      LiveConnectionChanged(LiveConnectionPhase.connected),
+    ]);
+    await tester.pumpAndSettle();
+    expect(find.text('实时弹幕已连接').hitTestable(), findsOneWidget);
+    receiveMessages(0, 10);
+    await tester.pumpAndSettle();
+    expect(find.text('实时弹幕已连接').hitTestable(), findsNothing);
+    await showPage(tester, roomId: '13', width: 320, height: 640, textScale: 2);
+    realtime.events.add(const [
+      LiveConnectionChanged(LiveConnectionPhase.connected),
+    ]);
+    await tester.pumpAndSettle();
+    expect(find.text('实时弹幕已连接').hitTestable(), findsOneWidget);
+    expect(find.textContaining('新消息 9 '), findsNothing);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('short room ID keeps player on the sidebar message controller', (
+    tester,
+  ) async {
+    repository.canonicalRoom = const LiveRoom(
+      id: RoomId('12345'),
+      title: '真实房间',
+      anchorName: '主播',
+      isLive: true,
+    );
+    RoomId? requested;
+    RoomId? canonical;
+    await showPage(
+      tester,
+      playerBuilder: (context, room) {
+        requested = LiveDanmakuRoomScope.requestedIdOf(context);
+        canonical = room.id;
+        return const _PlayerProbe();
+      },
+    );
+    expect(requested, const RoomId('12'));
+    expect(canonical, const RoomId('12345'));
+    expect(realtime.opens, 1);
+  });
+}
+
+final class _RealtimeRepository implements LiveChatRepository {
+  final events = StreamController<List<LiveRealtimeEvent>>.broadcast(
+    sync: true,
+  );
+  final reads = <RequestCancellation>[];
+  int opens = 0;
+
+  @override
+  Stream<List<LiveRealtimeEvent>> watchRoom(
+    RoomId id, {
+    required RequestCancellation cancellation,
+  }) {
+    opens++;
+    reads.add(cancellation);
+    return events.stream;
+  }
+}
+
+final class _Repository implements LiveRepository {
+  AppFailure? superChatFailure;
+  LiveRoom? canonicalRoom;
+  List<LiveSuperChatMessage> scMessages = superChats;
+  List<LiveChatMessage> chatMessages = const [
+    LiveChatMessage(userName: '普通观众', text: '普通聊天消息'),
+  ];
+
+  @override
+  String get accountScope => 'guest';
+  @override
+  int get sessionEpoch => 0;
+
+  @override
+  Future<LiveRoom> loadRoom(
+    RoomId id, {
+    required RequestCancellation cancellation,
+  }) async => canonicalRoom ?? room;
+
+  @override
+  Future<LivePlayInfo> loadPlayInfo(
+    RoomId id, {
+    int quality = 10000,
+    required RequestCancellation cancellation,
+  }) async =>
+      const LivePlayInfo(roomId: RoomId('12'), isLive: true, streams: []);
+
+  @override
+  Future<List<LiveChatMessage>> loadChatHistory(
+    RoomId id, {
+    required RequestCancellation cancellation,
+  }) async => chatMessages;
+
+  @override
+  Future<List<LiveSuperChatMessage>> loadSuperChats(
+    RoomId id, {
+    required RequestCancellation cancellation,
+  }) async {
+    if (superChatFailure case final failure?) throw failure;
+    return scMessages;
+  }
+}
+
+final class _AuthRepository implements AuthRepository {
+  @override
+  Stream<AuthState> get changes => const Stream.empty();
+  @override
+  AuthState get current => const AuthState();
+  @override
+  Future<void> restore() async {}
+  @override
+  Future<void> signIn() async {}
+  @override
+  Future<void> signOut() async {}
+  @override
+  void cancelSignIn() {}
+}
+
+final class _PlayerProbe extends StatefulWidget {
+  const _PlayerProbe();
+
+  @override
+  State<_PlayerProbe> createState() => _PlayerProbeState();
+}
+
+final class _PlayerProbeState extends State<_PlayerProbe> {
+  @override
+  Widget build(BuildContext context) => const ColoredBox(color: Colors.black);
+}

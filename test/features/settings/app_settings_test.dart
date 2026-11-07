@@ -1,0 +1,362 @@
+import 'package:bilisail/features/settings/domain/app_settings.dart';
+import 'package:flutter_test/flutter_test.dart';
+
+void main() {
+  test(
+    'send style defaults, copies and validates each field independently',
+    () {
+      expect(AppSettings().danmakuSendStyle, (
+        mode: 1,
+        color: 0xffffff,
+        colorful: false,
+      ));
+      expect(const AppSettings.defaults().danmakuSendStyle, (
+        mode: 1,
+        color: 0xffffff,
+        colorful: false,
+      ));
+      for (final mode in [1, 4, 5]) {
+        for (final color in [0, 1, 0x123456, 0xffffff]) {
+          expect(
+            AppSettings(
+              danmakuSendStyle: (mode: mode, color: color, colorful: false),
+            ).normalized().copyWith(autoPlay: false).danmakuSendStyle,
+            (mode: mode, color: color, colorful: false),
+          );
+        }
+      }
+      expect(
+        AppSettings(
+          danmakuSendStyle: (mode: 2, color: 0x123456, colorful: false),
+        ).normalized().danmakuSendStyle,
+        (mode: 1, color: 0x123456, colorful: false),
+      );
+      for (final color in [-1, 0x1000000]) {
+        expect(
+          AppSettings(
+            danmakuSendStyle: (mode: 4, color: color, colorful: false),
+          ).normalized().danmakuSendStyle,
+          (mode: 4, color: 0xffffff, colorful: false),
+        );
+      }
+    },
+  );
+
+  test('all video quality IDs survive normalization and copying', () {
+    const qualities = [16, 32, 64, 74, 80, 112, 116, 120, 125, 126, 127];
+    expect(AppSettings.supportedQualities, qualities);
+    for (final quality in qualities) {
+      final settings = AppSettings(preferredQuality: quality)
+          .normalized()
+          .copyWith(autoPlay: false);
+      expect(settings.preferredQuality, quality);
+    }
+    for (final invalid in [0, -1, 400, 999]) {
+      expect(
+        AppSettings(preferredQuality: invalid).normalized().preferredQuality,
+        80,
+      );
+    }
+  });
+
+  test('hover playback defaults on and preserves explicit choices', () {
+    expect(const AppSettings.defaults().videoCardHoverPlayback, isTrue);
+    expect(AppSettings().videoCardHoverPlayback, isTrue);
+    expect(
+      const AppSettings.defaults(videoCardHoverPlayback: false)
+          .copyWith(theme: AppThemePreference.dark)
+          .normalized()
+          .videoCardHoverPlayback,
+      isFalse,
+    );
+    for (final enabled in [false, true]) {
+      final settings = AppSettings(videoCardHoverPlayback: enabled)
+          .normalized()
+          .copyWith(autoPlay: false);
+      expect(settings.videoCardHoverPlayback, enabled);
+      expect(settings.autoPlay, isFalse);
+    }
+  });
+
+  test('navigation defaults to dual tabs', () {
+    expect(AppSettings().navigationMode, WorkspaceNavigationMode.dualTabs);
+    expect(
+      const AppSettings.defaults().navigationMode,
+      WorkspaceNavigationMode.dualTabs,
+    );
+  });
+
+  test('wheel damping defaults, copies and normalizes independently', () {
+    expect(const AppSettings.defaults().wheelDampingRatio, 1.3);
+    expect(AppSettings().wheelDampingRatio, 1.3);
+    for (final entry in <double, double>{
+      -1: .5,
+      .5: .5,
+      .75: .75,
+      1: 1,
+      2: 2,
+      3: 2,
+      double.nan: 1.3,
+      double.infinity: 1.3,
+      double.negativeInfinity: 1.3,
+    }.entries) {
+      final settings = AppSettings(wheelDampingRatio: entry.key)
+          .normalized()
+          .copyWith(theme: AppThemePreference.dark);
+      expect(settings.wheelDampingRatio, entry.value);
+      expect(settings.theme, AppThemePreference.dark);
+    }
+  });
+
+  test('live and video quality defaults normalize independently', () {
+    expect(const AppSettings.defaults().preferredLiveQuality, 10000);
+    expect(AppSettings().preferredLiveQuality, 10000);
+    for (final quality in AppSettings.liveQualityOptions.keys) {
+      final settings = const AppSettings.defaults()
+          .copyWith(preferredLiveQuality: quality, preferredQuality: 120)
+          .normalized()
+          .copyWith(theme: AppThemePreference.dark);
+      expect(settings.preferredLiveQuality, quality);
+      expect(settings.preferredQuality, 120);
+    }
+    for (final quality in [-1, 64, 112, 99999]) {
+      final settings = AppSettings(
+        preferredLiveQuality: quality,
+        preferredQuality: 64,
+      ).normalized();
+      expect(settings.preferredLiveQuality, 10000);
+      expect(settings.preferredQuality, 64);
+    }
+    final settings = AppSettings(
+      preferredQuality: 400,
+      preferredLiveQuality: 250,
+    ).normalized();
+    expect(settings.preferredQuality, 80);
+    expect(settings.preferredLiveQuality, 250);
+  });
+  test('danmaku font scale supports one fifth size and normalizes bounds', () {
+    for (final entry in <double, double>{
+      .1: .2,
+      .2: .2,
+      .5: .5,
+      .7: .7,
+      1.5: 1.5,
+      2: 1.5,
+      double.nan: 1,
+      double.infinity: 1,
+    }.entries) {
+      expect(
+        AppSettings(danmakuFontScale: entry.key).normalized().danmakuFontScale,
+        entry.value,
+      );
+    }
+  });
+  test('player controls default to click and preserve the chosen mode', () {
+    expect(AppSettings().playerControlsMode, PlayerControlsMode.click);
+    expect(
+      const AppSettings.defaults().playerControlsMode,
+      PlayerControlsMode.click,
+    );
+    expect(
+      const AppSettings.defaults()
+          .copyWith(playerControlsMode: PlayerControlsMode.dynamic)
+          .normalized()
+          .copyWith(theme: AppThemePreference.dark)
+          .playerControlsMode,
+      PlayerControlsMode.dynamic,
+    );
+  });
+  test('danmaku line spacing preserves the default and normalizes bounds', () {
+    expect(const AppSettings.defaults().danmakuLineSpacing, 5);
+    expect(AppSettings().danmakuLineSpacing, 5);
+    expect(
+      const AppSettings.defaults()
+          .copyWith(danmakuLineSpacing: 80)
+          .normalized()
+          .copyWith(danmakuOpacity: .5)
+          .danmakuLineSpacing,
+      80,
+    );
+    for (final entry in <double, double>{
+      -4: 0,
+      0: 0,
+      200: 100,
+      double.nan: 5,
+      double.infinity: 5,
+    }.entries) {
+      expect(
+        AppSettings(danmakuLineSpacing: entry.key)
+            .normalized()
+            .danmakuLineSpacing,
+        entry.value,
+      );
+    }
+  });
+  test(
+    'concurrent playback requires multiple tabs and an enabled preference',
+    () {
+      expect(AppSettings().allowConcurrentPlayback, isFalse);
+      expect(const AppSettings.defaults().allowConcurrentPlayback, isFalse);
+      for (final mode in WorkspaceNavigationMode.values) {
+        for (final allowed in [false, true]) {
+          final settings = const AppSettings.defaults()
+              .copyWith(navigationMode: mode, allowConcurrentPlayback: allowed)
+              .normalized();
+          expect(settings.allowConcurrentPlayback, allowed);
+          expect(
+            settings.concurrentPlaybackEnabled,
+            mode == WorkspaceNavigationMode.multipleTabs && allowed,
+          );
+          expect(
+            settings
+                .copyWith(theme: AppThemePreference.dark)
+                .allowConcurrentPlayback,
+            allowed,
+          );
+        }
+      }
+    },
+  );
+  test(
+    'danmaku style defaults preserve existing behavior and clamp limits',
+    () {
+      final defaults = const AppSettings.defaults();
+      expect(defaults.danmakuFont, DanmakuFontPreference.system);
+      expect(defaults.danmakuStyle, DanmakuStylePreference.shadow);
+      expect(defaults.danmakuBold, isFalse);
+      expect(defaults.danmakuMergeDuplicates, isFalse);
+      expect(defaults.danmakuBlockColored, isFalse);
+      expect(defaults.danmakuMinimumWeight, 0);
+      expect(defaults.danmakuOffset, Duration.zero);
+      final copy = defaults
+          .copyWith(
+            danmakuFont: DanmakuFontPreference.harmonyOsSans,
+            danmakuStyle: DanmakuStylePreference.plain,
+            danmakuBold: true,
+            danmakuMergeDuplicates: true,
+            danmakuBlockColored: true,
+            danmakuMinimumWeight: 20,
+            danmakuMaxPerSecond: 0,
+            danmakuOffset: const Duration(seconds: -90),
+          )
+          .normalized();
+      expect(copy.danmakuFont, DanmakuFontPreference.harmonyOsSans);
+      expect(copy.danmakuStyle, DanmakuStylePreference.plain);
+      expect(copy.danmakuBold, isTrue);
+      expect(copy.danmakuMergeDuplicates, isTrue);
+      expect(copy.danmakuBlockColored, isTrue);
+      expect(copy.danmakuMinimumWeight, 10);
+      expect(copy.danmakuMaxPerSecond, 0);
+      expect(copy.danmakuOffset, const Duration(seconds: -60));
+      expect(
+        AppSettings(
+          danmakuMaxPerSecond: -1,
+          danmakuMinimumWeight: -1,
+        ).normalized().danmakuMaxPerSecond,
+        0,
+      );
+    },
+  );
+  test('danmaku top margin defaults to zero and normalizes its bounds', () {
+    expect(const AppSettings.defaults().danmakuTopMargin, 0);
+    expect(AppSettings().danmakuTopMargin, 0);
+    expect(
+      const AppSettings.defaults()
+          .copyWith(danmakuTopMargin: 48)
+          .normalized()
+          .danmakuTopMargin,
+      48,
+    );
+    for (final entry in <double, double>{
+      -4: 0,
+      300: 200,
+      double.nan: 0,
+      double.infinity: 0,
+    }.entries) {
+      expect(
+        AppSettings(danmakuTopMargin: entry.key).normalized().danmakuTopMargin,
+        entry.value,
+      );
+    }
+  });
+  test('image cache defaults on and survives copy normalization', () {
+    expect(const AppSettings.defaults().cacheImages, isTrue);
+    expect(AppSettings().cacheImages, isTrue);
+    expect(
+      const AppSettings.defaults()
+          .copyWith(cacheImages: false)
+          .normalized()
+          .cacheImages,
+      isFalse,
+    );
+  });
+  test('legacy continuous default speeds normalize to supported steps', () {
+    for (final entry in <double, double>{
+      .25: .5,
+      1.8: 2,
+      2.7: 3,
+      5: 3,
+      double.nan: 1,
+    }.entries) {
+      expect(
+        AppSettings(defaultPlaybackRate: entry.key)
+            .normalized()
+            .defaultPlaybackRate,
+        entry.value,
+      );
+    }
+    expect(
+      AppSettings(defaultPlaybackRate: 3).normalized().defaultPlaybackRate,
+      3,
+    );
+  });
+  test(
+    'constructor snapshots caller lists and exposes read-only collections',
+    () {
+      final words = ['original'];
+      final categories = ['sponsor'];
+      final settings = AppSettings(
+        danmakuBlockedWords: words,
+        sponsorBlockCategories: categories,
+      );
+      words[0] = 'changed';
+      words.add('later');
+      categories.clear();
+      expect(settings.danmakuBlockedWords, ['original']);
+      expect(settings.sponsorBlockCategories, ['sponsor']);
+      expect(
+        () => settings.danmakuBlockedWords.add('mutation'),
+        throwsUnsupportedError,
+      );
+      expect(
+        () => settings.sponsorBlockCategories.clear(),
+        throwsUnsupportedError,
+      );
+    },
+  );
+  test(
+    'copyWith snapshots replacement lists without changing the original',
+    () {
+      const original = AppSettings.defaults();
+      final words = ['replacement'];
+      final categories = ['intro'];
+      final copy = original.copyWith(
+        danmakuBlockedWords: words,
+        sponsorBlockCategories: categories,
+      );
+      words.clear();
+      categories.add('outro');
+      expect(copy.danmakuBlockedWords, ['replacement']);
+      expect(copy.sponsorBlockCategories, ['intro']);
+      expect(original.danmakuBlockedWords, isEmpty);
+      expect(
+        original.sponsorBlockCategories,
+        AppSettings.supportedSponsorCategories,
+      );
+      expect(
+        () => original.sponsorBlockCategories.add('mutation'),
+        throwsUnsupportedError,
+      );
+    },
+  );
+}

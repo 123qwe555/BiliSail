@@ -1,0 +1,266 @@
+name: Release preview
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '版本 x.y.z+N（留空使用 pubspec.yaml，例如 0.1.0+1）'
+        type: string
+        required: false
+        default: ''
+      reuse_ci_build:
+        description: '按平台复用同提交、同版本的已完成 CI 构建，仅构建缺少的目标'
+        type: boolean
+        default: false
+      enable_android:
+        description: Android arm64 APK
+        type: boolean
+        default: true
+      enable_windows:
+        description: Windows x64 / ARM64 MSIX / MSI / EXE 安装包
+        type: boolean
+        default: true
+      enable_macos:
+        description: macOS arm64 / Intel x64 DMG 安装文件
+        type: boolean
+        default: true
+      enable_ios:
+        description: iOS arm64 未签名 IPA（安装前需自行签名）
+        type: boolean
+        default: true
+      enable_linux:
+        description: Linux x64 Flatpak / AppImage
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-preview
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Resolve release build source
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      version: ${{ steps.plan.outputs.version }}
+      matrix: ${{ steps.plan.outputs.matrix }}
+      reused: ${{ steps.reuse.outputs.reused }}
+      build_targets: ${{ steps.reuse.outputs.build_targets }}
+      build_required: ${{ steps.reuse.outputs.build_required }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Resolve version and platforms
+        id: plan
+        shell: pwsh
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
+          ENABLE_ANDROID: ${{ inputs.enable_android }}
+          ENABLE_WINDOWS: ${{ inputs.enable_windows }}
+          ENABLE_MACOS: ${{ inputs.enable_macos }}
+          ENABLE_IOS: ${{ inputs.enable_ios }}
+          ENABLE_LINUX: ${{ inputs.enable_linux }}
+        run: ./tool/ci-build-plan.ps1
+      - name: Plan reused packages and missing platform builds
+        id: reuse
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          RELEASE_VERSION: ${{ steps.plan.outputs.version }}
+          BUILD_MATRIX: ${{ steps.plan.outputs.matrix }}
+          REUSE_CI_BUILD: ${{ inputs.reuse_ci_build }}
+        with:
+          script: |
+            const { planReleaseBuilds } = require('./tool/release-ci-reuse.cjs');
+            const plan = await planReleaseBuilds({
+              github, context, version: process.env.RELEASE_VERSION,
+              targets: JSON.parse(process.env.BUILD_MATRIX).include.map(({ target }) => target),
+              reuseCiBuild: process.env.REUSE_CI_BUILD === 'true',
+            });
+            core.setOutput('reused', JSON.stringify(plan.reused));
+            core.setOutput('build_targets', JSON.stringify(plan.buildTargets));
+            core.setOutput('build_required', plan.buildTargets.length > 0);
+            const rows = [
+              ...plan.reused.map(({ target, runUrl }) => [target, 'Reuse', runUrl]),
+              ...plan.buildTargets.map((target) => [target, 'Build', 'This release run']),
+            ];
+            for (const row of rows) core.info(row.join(': '));
+            await core.summary.addHeading('Release build sources')
+              .addTable([['Target', 'Action', 'Source'], ...rows]).write();
+
+  build:
+    needs: prepare
+    if: needs.prepare.outputs.build_required == 'true'
+    uses: ./.github/workflows/ci.yml
+    with:
+      version: ${{ needs.prepare.outputs.version }}
+      build_targets: ${{ needs.prepare.outputs.build_targets }}
+      enable_android: ${{ inputs.enable_android }}
+      enable_windows: ${{ inputs.enable_windows }}
+      enable_macos: ${{ inputs.enable_macos }}
+      enable_ios: ${{ inputs.enable_ios }}
+      enable_linux: ${{ inputs.enable_linux }}
+    secrets:
+      ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+      ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+      ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+      ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+      MSIX_CERTIFICATE_BASE64: ${{ secrets.MSIX_CERTIFICATE_BASE64 }}
+      MSIX_CERTIFICATE_PASSWORD: ${{ secrets.MSIX_CERTIFICATE_PASSWORD }}
+
+  draft:
+    name: Create release draft
+    needs: [prepare, build]
+    if: >-
+      ${{ !cancelled() && needs.prepare.result == 'success' &&
+          ((needs.prepare.outputs.build_required == 'false' && needs.build.result == 'skipped') ||
+           (needs.prepare.outputs.build_required == 'true' && needs.build.result == 'success')) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Download packages built in this run
+        if: needs.prepare.outputs.build_required == 'true'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: BiliSail-*-${{ needs.prepare.outputs.version }}-packages
+          path: release-assets
+          merge-multiple: true
+      - name: Download reused packages from their source CI runs
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REUSED_PACKAGES: ${{ needs.prepare.outputs.reused }}
+        with:
+          script: |
+            const { downloadReusedArtifacts } = require('./tool/release-ci-reuse.cjs');
+            await downloadReusedArtifacts({
+              reused: JSON.parse(process.env.REUSED_PACKAGES),
+              repository: `${context.repo.owner}/${context.repo.repo}`,
+              directory: 'release-assets',
+            });
+      - name: Verify selected packages, source, version and checksums
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+          BUILD_MATRIX: ${{ needs.prepare.outputs.matrix }}
+        with:
+          script: |
+            const { readFileSync } = require('node:fs');
+            const { createHash } = require('node:crypto');
+            const { verifyReleaseAssets } = require('./tool/release-ci-reuse.cjs');
+            // Windows checkout can use CRLF; metadata hashes the original file bytes.
+            const lockfile = readFileSync('pubspec.lock', 'utf8').replace(/\r\n/g, '\n');
+            await verifyReleaseAssets({
+              directory: 'release-assets', version: process.env.RELEASE_VERSION,
+              targets: JSON.parse(process.env.BUILD_MATRIX).include.map(({ target }) => target),
+              sourceRevision: context.sha,
+              flutterVersion: readFileSync('.flutter-version', 'utf8').trim(),
+              pubspecLockSha256s: [lockfile, lockfile.replace(/\n/g, '\r\n')]
+                .map((content) => createHash('sha256').update(content).digest('hex')),
+            });
+      - name: Upload all selected packages as one archive
+        id: release_bundle
+        # Artifact downloads are ZIP archives; include fresh and reused packages.
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: BiliSail-${{ needs.prepare.outputs.version }}-release-bundle
+          path: |
+            release-assets/*
+            THIRD_PARTY_NOTICES.md
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+          overwrite: true
+      - name: Create preview draft with all selected packages
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+          RELEASE_BUNDLE_ID: ${{ steps.release_bundle.outputs.artifact-id }}
+          RELEASE_BUNDLE_DIGEST: ${{ steps.release_bundle.outputs.artifact-digest }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = "v$env:RELEASE_VERSION"
+          # Never attach a new build to a pre-existing tag pointing at another revision.
+          $refs = gh api "repos/$env:GITHUB_REPOSITORY/git/matching-refs/tags/$tag"
+          if ($LASTEXITCODE -ne 0) { throw 'Could not check existing release tags.' }
+          if (@($refs | ConvertFrom-Json | Where-Object { $_.ref -eq "refs/tags/$tag" }).Count) {
+            throw "Tag $tag already exists. Use a new version."
+          }
+          $assets = @(Get-ChildItem release-assets -File |
+            Where-Object { $_.Name -notmatch '\.(build-info\.json|mux-source\.zip)(\.sha256)?$' } |
+            ForEach-Object { $_.FullName })
+          if (!$assets.Count) { throw 'No build assets were downloaded.' }
+          # Attach the exact ZIP generated by upload-artifact, including reused packages.
+          $bundleName = "BiliSail-$env:RELEASE_VERSION-release-bundle.zip"
+          $bundlePath = Join-Path $PWD $bundleName
+          Invoke-WebRequest -Uri "$env:GITHUB_API_URL/repos/$env:GITHUB_REPOSITORY/actions/artifacts/$env:RELEASE_BUNDLE_ID/zip" -Headers @{
+            Authorization = "Bearer $env:GH_TOKEN"
+            Accept = 'application/vnd.github+json'
+          } -OutFile $bundlePath -TimeoutSec 600
+          $bundleHash = (Get-FileHash -LiteralPath $bundlePath -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($bundleHash -ne $env:RELEASE_BUNDLE_DIGEST) { throw 'Release bundle SHA-256 does not match the uploaded artifact.' }
+          "$bundleHash  $bundleName" | Set-Content -LiteralPath "$bundlePath.sha256" -Encoding utf8
+          $assets += @($bundlePath, "$bundlePath.sha256")
+          $notes = @"
+          BiliSail（哔帆）$env:RELEASE_VERSION 预览构建。
+
+          国内下载：[夸克网盘](https://pan.quark.cn/s/ffceda8afc83)。
+
+          - 源码提交：$env:GITHUB_SHA
+          - Flutter 3.47.6；各平台 SDK、签名信息及 mux 源码归档见 [Actions 构建记录]($env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID) 中所列的来源构建产物。
+          - 仅包含本次选中的平台；包旁附 SHA-256 校验文件。
+          - $bundleName 汇总本次所选平台的完整产物，包含安装包、构建信息、mux 源码归档、校验文件与第三方说明，可一次下载。
+          - Windows 同时提供 MSIX、MSI 和 EXE 安装包；EXE 内嵌同一 MSI，任选一种安装。MSI 向导可选择安装目录，EXE 通过 Options → Browse 选择，升级默认沿用原目录。三者复用同一签名证书，测试签名需先信任包旁的 .cer。
+          - Android 复用仓库配置的固定 release keystore；macOS 仅 ad-hoc 签名，未 notarize。
+          - macOS 分别提供 Apple Silicon arm64 与 Intel x64 DMG，按芯片选择；打开后将 BiliSail.app 拖到 Applications 安装。
+          - iOS 提供 arm64 未签名 IPA，安装前须使用自己的 Apple 证书及 provisioning profile 签名；GitHub Actions token 只用于上传产物和 Release。
+          - Linux x64 提供 AppImage 与 Flatpak。AppImage 基线为 Ubuntu 24.04，Flatpak 使用 Freedesktop 25.08 runtime；图形使用 X11／XWayland，登录需可用的系统 Secret Service。
+          - 构建成功不等于各平台播放验收；正式分发前仍需完成签名、资源许可和设备验证。
+          "@
+          $notes | Set-Content release-notes.md -Encoding utf8
+          gh release create $tag @assets THIRD_PARTY_NOTICES.md --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --title "BiliSail $env:RELEASE_VERSION preview" --notes-file release-notes.md --draft --prerelease
+          if ($LASTEXITCODE -ne 0) { throw 'Creating the release draft failed.' }
+      - name: Keep the latest 15 releases
+        # Run only after the new draft and all assets have been uploaded successfully.
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const keepLatest = 15;
+            const releases = await github.paginate(github.rest.repos.listReleases, {
+              ...context.repo,
+              per_page: 100,
+            });
+            // Drafts have no published_at; include them using created_at.
+            releases.sort((a, b) =>
+              Date.parse(b.created_at) - Date.parse(a.created_at) || b.id - a.id);
+            for (const release of releases.slice(keepLatest)) {
+              await github.rest.repos.deleteRelease({
+                ...context.repo,
+                release_id: release.id,
+              });
+              core.info(`Deleted release ${release.tag_name} (${release.id}).`);
+            }
+      - name: Verify release retention limit
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $releaseIds = @(gh api "repos/$env:GITHUB_REPOSITORY/releases?per_page=100" --paginate --jq '.[].id')
+          if ($LASTEXITCODE -ne 0) { throw 'Could not verify release retention.' }
+          if ($releaseIds.Count -gt 15) { throw "Release cleanup incomplete: $($releaseIds.Count) releases remain (limit: 15)." }
+          Write-Output "Release retention verified: $($releaseIds.Count) releases remain."

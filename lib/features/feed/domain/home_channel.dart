@@ -1,0 +1,45 @@
+/// Public home destinations; unsupported services keep their own empty state.
+enum HomeChannel {
+  recommended('推荐'),
+  popular('热门'),
+  dynamic('动态'),
+  videoDynamic('视频动态'),
+  live('直播'),
+  bangumi('番剧'),
+  guochuang('国创'),
+  cinema('放映厅'),
+  categories('分区'),
+  ranking('排行榜'),
+  watchLater('稍后再看'),
+  favorites('我的收藏');
+
+  const HomeChannel(this.label);
+  final String label;
+
+  static final primaryValues = List<HomeChannel>.unmodifiable(
+    values.where((channel) => channel != ranking),
+  );
+
+  bool get hasVideoFeed => switch (this) {
+    recommended || popular || categories || ranking => true,
+    _ => false,
+  };
+
+  bool get requiresAccount => switch (this) {
+    dynamic || videoDynamic || watchLater || favorites => true,
+    _ => false,
+  };
+
+  List<String> get sections => switch (this) {
+    popular => const ['综合热门', '每周必看', '入站必刷', '排行榜'],
+    dynamic => const ['全部', '视频', '图文'],
+    videoDynamic => const ['最新视频'],
+    bangumi => const ['推荐', '时间表', '番剧索引', '我的追番'],
+    guochuang => const ['推荐', '时间表', '国创索引', '我的追番'],
+    live => const ['推荐直播', '我的关注', '观看记录'],
+    cinema => const ['推荐', '电影', '电视剧', '纪录片', '综艺'],
+    watchLater => const ['全部', '未看完'],
+    favorites => const ['默认收藏夹', '我创建的收藏夹', '我的收藏与订阅', '我的追番', '我的追剧'],
+    _ => const [],
+  };
+}

@@ -1,0 +1,35 @@
+# 合集状态异常与 Windows 播放期间崩溃
+
+日期：2026-10-06。用户反馈合集卡片显示“服务返回了暂不支持的数据”，并补充程序在播放一段时间后崩溃；二者分别排查。
+
+## 已取得证据
+
+- 合集详情 `/x/space/fav/season/list` 的公开只读正常响应没有 `info.fav_state`。此前新客户端假定该字段存在，所以把正常数据判成协议错误；`info.id` 校验不是此次原因。首轮修正曾分页扫描当前账号收藏列表；用户提出效率疑问后，进一步核对 GitHub 和官网脚本，确认 `/x/web-interface/archive/relation` 的 `season_fav` 就是官网合集按钮使用的订阅态，现已替换全列表扫描。协议依据与最新构建见 [合集订阅按钮](collection-subscription.md)。
+- Windows Application 事件记录本次 `bilisail.exe` 进程 40992 于本地 14:14:36 崩溃，模块 `flutter_windows.dll`，异常 `0xc0000005`，偏移 `0x3c1ca`。读取本机 `CrashDumps/bilisail.exe.40992.dmp`，使用当前 SDK 的 `windows-x64-release/flutter_windows.dll.pdb`，异常指令符号为 `flutter::AccessibilityBridge::CreateRemoveReparentedNodesUpdate+0xba`；异常参数是读取地址 `0x48`，寄存器 `rax=0`。只采用异常位置的匹配符号，后续自动栈展开不可靠，不作为调用链证据。
+- 固定 Flutter 3.47.6，framework `5fc346839b5d0eef006ed8404392afb4dfae428d`、engine `692136cb6582dbfc5af3fb33c2515a069f2f66d0`。本地 engine 的 `accessibility_bridge.cc` 在重挂节点时仅用 `assert(child->parent())`，Release 随后仍会访问 `child->parent()->id()`；断言不能保护空指针。
+- [Flutter issue 193410](https://github.com/flutter/flutter/issues/193410) 的 Windows `Slider`／`IndexedStack` 复现有相同异常符号和 `+0xba` 偏移。[PR 190903](https://github.com/flutter/flutter/pull/190903) 提供原生空父节点保护，截至本次查看仍未合入。结合本机转储，可确认此次故障点是 Windows 无障碍树重挂的空指针访问；无法从转储确定具体是哪一个 Flutter 控件首先产生错误更新。
+- 应用工作区保留隐藏的设置页 `Slider`，播放页有时间轴／音量 `Slider` 与 `OverlayPortal`。SDK 的 Material Slider 会始终挂载其 value-indicator portal；隐藏页面的绘制祖先与无障碍遍历祖先可因此不同。其结构与上游复现接近，不能把“查看评论”或某个 `IndexedStack` 单独定为已证实的触发条件。播放日志未提供媒体解码崩溃证据。
+
+## 应用侧修正
+
+新增 `core/presentation/bili_widgets_binding.dart`，由 `main.dart` 在初始化时安装。Windows 语义更新使用保护路径；2026-10-25 为独立播放窗口扩展到按 view 的 SemanticsOwner 分别维护。不升级或改写全局 SDK、原生 DLL、播放器和依赖，不强制关闭无障碍。
+
+- 从当前 `SemanticsOwner` 根节点及原始 portal identifiers 推导实际遍历连通性，排除 merged 后代；不把 attached 状态或旧序列化缓存等同于当前可见。
+- 仅向原生端提交连通节点。遍历子列表剔除根 ID 0、自引用、循环／双父以及旧父引用；命中列表保持其独立次序，只过滤无效或不连通节点，不将两套子列表强行合并。
+- 缓存每个仍由当前 owner 持有的节点的最新不可变参数；列表／矩阵拥有副本。重新连通的干净节点补发数据，过滤导致干净父节点子边改变时也补发父节点，保留标签页面状态、语义字段和自定义动作。
+- 缓存同时核对 owner 与节点对象身份，避免 ID 复用；节点移除、owner 更换和关闭语义时清理，不写盘或输出语义文字。
+- 多 view 按 owner 和根对象身份隔离；批次先收集更新，再由非根 ID 或根子 ID 确定归属。仅含空根且无法区分的批次不污染任何 owner 的根 ID 0 缓存，并令后续重发干净节点。关闭 view、替换根或关闭语义时清理。Android／macOS 保持标准语义更新，未将 Windows 规避结论推广至其他平台。
+
+源码依据为本机锁定的 Flutter public API 和语义序列化实现（Flutter BSD-3-Clause）。同时阅读 [OpenHarness 的公开应用侧方案](https://github.com/autonomous-ai/openharness/pull/620) 了解连通过滤与干净节点重连思路；本项目按自身入口独立实现，没有导入该仓库源码、测试、资源或运行时依赖。上游 issue／外部方案均不能替代本项目运行验收；SDK 更新后应重新评估是否移除这层规避。
+
+## 构建与验收边界
+
+2026-10-25 多 view 扩展的 16 项定向回归及静态分析通过；本轮全量/窗口验证见[晴湾实施记录](../ui-redesign/implementation.md)。下列构建记录为原单 view 修复时的历史证据。
+
+按用户要求不运行或新增测试流程，没有自动执行订阅／取消等账号写入。根应用和 `bili_api` 静态分析通过，受影响 Dart 目录格式检查通过。分析与转储符号记录保存在忽略目录 `build/crash-diagnostics/`，未输出凭据或原始内存内容。
+
+用户旧版 Release 仍在运行，因此从独立源码快照 `build/collection-crash-fix-source` 构建，`flutter pub get --enforce-lockfile` 和 `flutter build windows --release --no-pub` 成功，最终构建 64.9 秒，日志为 `build/crash-diagnostics/windows-build.log`。复用原构建目录中 MD5 与锁定插件要求一致的 libmpv／ANGLE 压缩包，未更换原生库版本；构建保留插件既有 CMake CMP0175 开发警告。
+
+完整 Release 导出至 `artifacts/bilisail-collection-crash-fix-windows-x64`，共 50 个文件，入口 `bilisail.exe`。入口 SHA-256 为 `4BB397AC9E2F7CE48F28DECA6E213EADFBF36FFB123C9D5997A062807BE68CE7`，`data/app.so` 为 `2E41FE73B67280CC4F285E1BB6E1606E629FDBE4D8F160C4D2ADB1E0BB32796D`。已核对快照与当前主入口、binding、合集客户端、滚动组件及锁文件一致。需关闭旧版后从完整新目录启动，旧进程不会自动加载修正；未自动启动新版执行运行验收。
+
+此为对应已定位故障的应用侧规避，构建通过不能证明长时间播放已稳定。真实登录订阅态、持续播放、设置标签往返、评论／简介往返、窗口尺寸变化与 Windows 读屏行为交由用户验收；Android／macOS 本轮未构建或运行。

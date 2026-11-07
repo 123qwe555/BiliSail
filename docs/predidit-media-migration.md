@@ -1,0 +1,90 @@
+# canvas_danmaku 与 Predidit media-kit 切换方案
+
+> 2026-11-01 后续：按用户要求已改为 PiliPlus 锁定的依赖，当前实现见[依赖切换](validation/piliplus-dependencies-2026-11-01.md)。本文保留 Predidit 迁移及其历史验证，不能作为当前分支／原生库说明。
+
+日期：2026-10-29。用户要求将弹幕绘制与播放器依赖切换到 Predidit 的实现。本文同时记录实施范围和实际验证；构建、设备验收、性能结果分别列出。
+
+## 固定来源
+
+| 组件 | 源码提交 | 采用范围 |
+| --- | --- | --- |
+| [canvas_danmaku](https://github.com/Predidit/canvas_danmaku/tree/401915a11ae113cddb5409632cd99729f4b0a301) | `401915a11ae113cddb5409632cd99729f4b0a301`，包版本 0.3.3 | MIT；上游 Canvas 绘制管线，封装在 `bili_danmaku` 内 |
+| [media-kit](https://github.com/Predidit/media-kit/tree/83b7ca63772856e1ea0158916177e136f7b7b0be) | `83b7ca63772856e1ea0158916177e136f7b7b0be` | MIT；核心及视频插件使用同一提交，Native Assets 负责原生库 |
+
+只读检查目标源码，不修改相邻参考仓库，不修改 Pub 缓存。Git ref 使用完整提交；根应用保留核心 override，使直接、传递依赖解析到同一来源。四个独立包继续存在，协议、账号、播放队列不下沉。
+
+目标视频插件固定 `wakelock_plus 1.3.3`，其 `package_info_plus <9` 约束与本应用 10.2.2 冲突。已核对插件只调用 `WakelockPlus.enable/disable`，根应用和播放器包显式 override 为原已锁定的 `wakelock_plus 1.8.1`，不降低应用版本信息依赖。目标分支额外解析 `wakelock_plus_ohos`，本轮不增加 OHOS 应用目标。
+
+Android 的目标实现已替换旧 fork 的 `surface_lifecycle.dart`。应用继续传递 `androidAttachSurfaceAfterVideoParameters: false`，但本次固定的目标 Android 控制器没有读取该兼容字段；原播放器配置单测只验证传参，不证明旧 `on_load` 绑定顺序仍生效。首开、后台恢复、旋转／全屏和 Surface 重建须按目标分支的新策略重新做设备验收。
+
+## 实施顺序
+
+1. 固定上述提交，更新根应用、`bili_player`、`bili_danmaku` 的清单与相应锁文件。新 media-kit 已删除 `libs/`，移除全部 `media_kit_libs_*` 依赖及 override，不能把旧的七处路径机械改为新 URL。
+2. Windows 采用上游 D3D11/mailbox 输出及匹配的 DXGI libmpv。移除旧 ANGLE／LGPL DLL 注入；审查并保留“纹理注销、队列排空、渲染上下文释放后才回复 Dispose”的屏障。尺寸调整继续经包内适配，保留 generation、owner、延迟缩小和立即放大。
+3. `bili_danmaku` 保留无网络的点播／直播控制器、确认媒体时钟／单调到达时钟和容量限制，接入上游公开 painter。上游 `DanmakuScreen` 自带独立时钟，直接整件替换会丢失有界插值、暂停 seek 重建、混合字体、阴影和缓存预算，因此使用其可扩展绘制管线，布局及兼容设置仍由包内适配负责。每个 overlay 继续只有一个 Ticker，不引入第二套播放器或全局逐帧状态。
+4. 按 Native Assets 更新各平台打包：避免 Linux 打包时再次加入系统 mpv；Apple 最低部署版本核对固定 Flutter 的 framework 生成要求；保留 CocoaPods 路径，关闭 SwiftPM 的选择不在本轮混改。
+5. 执行根检查、弹幕像素／生命周期回归、播放器包测试，以及 Windows 本地分轨、直播夹具、关闭和窗口回归；构建 Windows Release。Android／macOS／iOS／Linux 没有在对应主机或设备验证前保留待验状态。
+
+## 必须保留的行为
+
+- 点播按确认位置触发，滚动时间独立于倍速；暂停／缓冲冻结，seek 确认后重建，超过有界插值窗口停止外推。
+- 直播按到达时钟调度，不跟随视频 seek；关闭／换房清理，普通／全屏继续使用同一控制器。
+- 滚动／顶部／底部、颜色、大小、字体、粗细、阴影／描边／纯色、透明度、区域、间距、偏移、去重和数量上限保留。过大文本及高 DPR 仍有内存预算与直接绘制降级。
+- 一个播放会话只有一个原生播放器，DASH 音视频分轨、headers、Range、备用恢复、播放意图与账号隔离沿用原契约。
+- 原生资产来源以固定 fork 的 `media_kit/hook/native_bundles.json` 的 URL 与 SHA-256 为准。新资产不能继续沿用旧 Windows `gpl=false` 结论；源码许可和二进制的子依赖许可分别记录于 [第三方说明](../THIRD_PARTY_NOTICES.md)。
+
+## 回退与验证边界
+
+回退时整体恢复本次清单、锁文件和平台适配，不混用两种原生协议或 DLL。设置与数据库没有迁移，不删除用户数据。旧 ANGLE 性能记录只描述旧实现，不能直接推导新 D3D11 的性能。
+
+## 当前实现边界
+
+`CanvasDanmakuRenderer` 继承上游公开 `BaseDanmakuPainter`，实际绘制经上游的批量 Picture 与图像采样路径执行。位置、轨道和有界文字／像素缓存继续由本包持有，文字 shaping 与阴影／描边适配没有改用上游全局字体选项。批次借用缓存图像，不取得释放所有权；发生淘汰或直接文字降级前先提交批次，保持所属绘制层内部的覆盖顺序。每帧复用有界 item 对象，不另建上游动画时钟。2026-11-01 按用户后续要求将滚动和固定内容分层，固定层在上，仍共用一个时钟、入场预算、像素缓存和外部组透明度；跨类型覆盖变化及性能结果见[分层记录](validation/danmaku-layers-performance-2026-11-01.md)。
+
+本轮没有把上游 `DanmakuScreen` 的轨道分配、独立计时或高级弹幕加入产品，因此不能将其所有功能或宣传的性能直接视为项目已有能力。如果后续需要整件替换轨道／缓存实现，须先为上游补齐媒体时钟、预算、混合字号和现有字体效果的适配契约。
+
+## 本机验证（2026-10-29）
+
+- 五份锁文件逐项 `pub get --offline --enforce-lockfile` 通过；三份相关锁文件由 Pub 重生成，另外两份保持原内容。
+- `tool/check.ps1 -SkipPub` 通过：根应用 3359、API 492、播放器 96、弹幕 118、mux 5，共 4070 项通过。根应用 13 项按原条件跳过，mux 10 项原生用例因未配置 `BILI_MUX_LIBRARY` 跳过，不计作原生封装覆盖。最终夹具调整后另跑 `-Stage Lint -SkipPub` 通过。
+- 弹幕新增 18 条混合内容触发上游批量路径，在阴影／描边／纯色和 DPR 1／1.25／2 下与逐条结果逐像素一致；原暂停、倍速、seek、全屏尺寸、预算与小容量淘汰用例继续通过。
+- Windows 原生 Flutter 回归共 27 项通过：主播放 8、诊断 1、打开／取消／超时 5、视频就绪 5、截断视频 2、预览缓冲 1、音量均衡 2、UGC／PGC／直播内容夹具 2、五分钟缓冲 1。使用本地文件／HTTP／HLS／FLV，无 `-Online`，不代表真实账号或 CDN 验收。
+- `tool/test-windows-video-dispose.ps1` 的 9 项受控原生回归通过；`tool/test-windows-gpu-queue.ps1` 对实际 D3D11 共享纹理完成 8 轮创建、绘制、像素读回、缩放及销毁。补丁校验另确认 LF／CRLF 等价源码可用，实质源码变更被拒绝；仍只修改构建副本。
+- 原生界面夹具修正了命中控件的旧 `(30, 50)` 点击坐标，并忽略已销毁测试 view 的残留原生指针包，之后主播放 8 项完整通过。播放产品交互没有因测试修改。
+- Windows x64 Release 已构建成功；增量安装会清理旧 ANGLE DLL、旧库插件及旧资产来源说明，打包当前 Native Assets 来源与第三方说明。正常入口固定为 `lib/main.dart`。
+- 另启动独立本地分轨＋弹幕调试夹具，确认日志实际使用 Flutter 同一 DXGI adapter 的 D3D11 输出，音视频均已解码；查看了合成测试图画面，热重载成功，Dart 工具报告无运行时错误。该画面检查不代替人工音画同步或性能测量，结束后已关闭夹具。
+- Android arm64 开发 Release 已通过标准脚本构建，实际包名 `dev.bilisail.bilisail.test`、名称 `BiliSail 测试版`、版本 1.2.4+0，脚本已校验签名及不可调试；未安装到设备。APK 含 `libmpv.so`、匹配 JNI helper、Native Assets 事件桥和独立 mux。SHA-256：`386af2780884a70d6396d46b88610f7aaa1fd2f0348e6f5402bdfafe0cb450df`。
+- Linux 打包边界原有 12 项 Python 回归通过；修改文档的相对路径和 `git diff --check` 通过。
+
+本地日志位于 `build/predidit-*.log`。Android 与 Windows 同时构建曾导致 Flutter 插件注册文件交叉更新；已改为串行并通过标准入口重新构建 Android Release，没有手改生成文件。
+
+macOS 部署下限提高至 13.0 的依据已核对固定 Flutter SDK `packages/flutter_tools/lib/src/isolated/native_assets/macos/native_assets.dart` 中的 `targetMacOSVersion = 13`。macOS／iOS／Linux 的本平台构建、Android 实机音画与 Surface、真实账号／长时间播放、跨 GPU 和性能对照尚未执行。新原生二进制完整分发材料仍需按来源归档；本轮未创建正式发布。
+
+## CI 构建兼容修复（2026-10-29）
+
+[CI #216](https://github.com/CKopoer/BiliSail/actions/runs/40738122479) 的检查和 Android 构建通过，三个 Apple 目标在 Swift 编译时缺少 mpv 声明，Linux 在打包时缺少 `libva-wayland.so.2`，Windows 仅输出 Native Assets 汇总错误。
+
+- 两份 Podfile 在 Flutter 创建插件链接后调用 [构建副本准备脚本](../tool/prepare-media-kit-apple.py)。校验固定 podspec 的 SHA-256，将插件复制到 `build/apple-plugins/<platform>/`，把共享 C 绑定放进 Pod 根目录并重定向生成的插件链接。framework 公共头文件在副本中展平，同步 wrapper 的 include 路径，兼容 Xcode 的 Headers 拷贝阶段。保留上游源码、许可和符号链接；不修改 Pub 缓存或依赖提交。升级依赖时必须重新审查校验值和目录布局。
+- Linux 显式安装 `libva-wayland2`，打包前输出固定 libmpv 的完整 `ldd` 结果。继续使用 Native Assets 的库，禁止用系统 mpv 替换。
+- Windows 打包脚本启用 Flutter verbose 输出；原生编译期间移除 MSIX 签名凭据，随后恢复供签名使用。失败时收集经过环境敏感值和 URL query 过滤的 hook 输入、输出与日志，上传独立诊断产物。
+- Windows CI #217 的详细日志确认系统 `tar` 报 `LZMA codec is unsupported`，在读取固定 mpv `.7z` 的目录阶段失败。CI 的 MSYS2 工具链补装 libarchive，通过 [工具配置脚本](../tool/setup-windows-native-tar.ps1) 记录 bsdtar 的绝对路径和版本，再由 [缓存准备脚本](../tool/prepare-windows-media-assets.ps1) 校验并解压固定资源。Native Assets 随后重新验证缓存；本地 Windows 无需替换已有可用工具。
+
+Windows 本地 `tool/check.ps1 -SkipPub` 通过格式、分析和 4070 项测试，根应用 13 项既有跳过，mux 10 项因未配置 `BILI_MUX_LIBRARY` 跳过；两项 Apple staging 回归、18 项 Linux 纯 Python 回归、PowerShell／Bash 语法和诊断脱敏检查通过。7 项 POSIX shell 运行时检查未在此 Windows 环境执行成功，交由 Ubuntu CI 验证。远端构建结果将在修复推送后的 CI 核验；以上不代表设备安装、音画或性能验收通过。
+
+[CI #217](https://github.com/CKopoer/BiliSail/actions/runs/40798307861) 的全部检查通过，包括 Ubuntu 上的 25 项 Linux 脚本检查、Apple staging 和 Ruby 语法检查。首次 staging 已解决源文件未收录，但 Apple 构建暴露了 framework umbrella header 仍引用嵌套 `mpv/client.h` 的问题，因此补上上述展平处理；本地对真实固定 C 绑定及公共头文件执行 Clang 语法检查通过，补改后的 `-Stage Lint -SkipPub` 通过。平台构建结论以包含补改的后续 CI 为准。
+
+该次 Linux x64 构建、AppImage／Flatpak 打包及已安装 Flatpak Runtime 的依赖检查通过，Android 构建通过。Windows 的 LZMA 工具修复在本地用相同 SHA-256 的真实固定 `.7z` 验证了目录读取和 DLL 解压；后续远端 Windows／Apple 结果仍需复验。
+
+CI #218 的检查通过。Apple 插件内部编译通过后，主应用导入 framework 时仍找不到 `client.h`；副本中同时移除 `header_mappings_dir`，让 CocoaPods 使用标准 Public Headers 阶段，并在 Podfile 的 post-install 中直接检查生成 Xcode 项目包含四个必要公共头文件。这样可在 pod install 时拦截只在源目录可见、没有导出给 Runner 的配置。
+
+Windows #218 进一步确认 Dart 子进程仍解析到系统 tar，单纯修改 PATH 不足以覆盖系统目录的查找顺序。改为通过绝对 bsdtar 路径预热 Native Assets 的内容寻址缓存：读取当前解析包的固定 catalog，核验 HTTPS 归档 SHA-256 和安全路径，写入逐文件 SHA-256 清单。原 hook 随后仍重新验证归档和所有文件，只省去不兼容的系统 tar 解压步骤；不修改 SDK、Pub 源码或原生资产来源。
+
+本地用真实固定归档准备独立缓存，并调用未修改的 `BundleCache.prepare`，确认 hook 完成哈希复核后直接复用缓存、未重建解压清单；最后一次根 `-Stage Lint -SkipPub` 通过。
+
+CI #219 的 iOS 和 macOS arm64 已通过构建／打包；Intel 构建及签名通过后，启动 smoke 在 60 秒内没有完成。固定 SDK 创建窗口不激活应用，原 smoke 却在等待首帧之后才激活主窗口。显式 smoke 改为先激活主窗再等待 rasterize，普通启动流程保持原样；新增异步回归覆盖后台窗口在激活后才收到首帧。超时仍判失败，并在停止该子进程、排空输出后导出固定阶段和数字焦点信息，保留脱敏 result JSON，禁止保存原始网络／原生日志。
+
+CI #220 的 Windows 资源缓存准备及原生 hook 已通过，后续干净 C++ 编译暴露补丁副本没有复制 `include/` 公共头文件目录，导致 C API 入口的相对 include 失败。补上该目录的构建副本复制，不改变播放器原生实现；本地以全新输出目录编译真实 C API 入口验证，避免旧构建残留掩盖缺项。
+
+上述补改后，完整 `tool/check.ps1 -SkipPub` 通过 4071 项测试（根 3360、API 492、播放器 96、弹幕 118、mux 5），13 项根测试及未配置原生库的 10 项 mux 用例沿用跳过。9 项受控原生生命周期／队列／尺寸回归和干净目录的 C API 编译通过。没有可连接的 DTD／调试应用，未做热重载；macOS 首帧顺序由后续目标 Release smoke 验证。
+
+最终 [CI #221](https://github.com/CKopoer/BiliSail/actions/runs/40804720827) 在代码提交 `64acaa709315b9c91e15c67ae173f56b05689570` 上全部通过：根检查、子包检查与原生 mux 检查，以及 Android arm64、Windows x64、macOS arm64／x64、iOS arm64、Linux x64 六个构建任务均成功，六份平台产物均已上传。Windows 完成 EXE／MSI／MSIX 打包与 MSIX 签名核验；两种 macOS 架构均完成待打包应用的签名校验、首帧及跨进程合成 Keychain 写入／读取删除／删除确认，并生成 DMG。Linux 完成 AppImage／Flatpak 打包和已安装 Flatpak Runtime 的依赖检查。上述结果不覆盖设备安装升级、Gatekeeper／系统证书信任、真实账号、音画播放或长期性能验收。

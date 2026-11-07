@@ -1,0 +1,493 @@
+import 'dart:async';
+
+import 'package:bilisail/domain/app_failure.dart';
+import 'package:bilisail/domain/request_cancellation.dart';
+import 'package:bilisail/domain/video.dart';
+import 'package:bilisail/features/auth/application/auth_controller.dart';
+import 'package:bilisail/features/auth/domain/auth_repository.dart';
+import 'package:bilisail/features/pgc/application/pgc_danmaku_controller.dart';
+import 'package:bilisail/features/pgc/domain/pgc_danmaku_repository.dart';
+import 'package:bilisail/features/pgc/domain/pgc_repository.dart';
+import 'package:bilisail/features/pgc/presentation/pgc_danmaku_composer.dart';
+import 'package:bilisail/features/playback/application/playback_session.dart';
+import 'package:bilisail/features/playback/domain/content_playback.dart';
+import 'package:bilisail/features/playback/domain/playback_repository.dart';
+import 'package:bilisail/features/settings/application/settings_controller.dart';
+
+import '../../support/memory_settings_repository.dart';
+
+import 'package:bilisail/shared/ui/app_notice.dart';
+import 'package:bili_player/bili_player.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:flutter_test/flutter_test.dart';
+
+const _episode = PgcEpisode(
+  id: PgcEpisodeId('7'),
+  title: '第 1 集',
+  bvid: 'BV1234567890',
+  cid: '101',
+);
+const _target = (episodeId: '7', video: VideoId('BV1234567890'), cid: '101');
+
+void main() {
+  test(
+    'member entitlement gates PGC sends and successful echoes keep the effect',
+    () async {
+      final harness = _Harness();
+      addTearDown(harness.dispose);
+      expect(
+        await harness.controller.send(
+          'member',
+          mode: 1,
+          color: 0xffffff,
+          colorful: true,
+        ),
+        isFalse,
+      );
+      expect(harness.repository.calls, 0);
+      harness.auth.emit(
+        const AuthState(status: AuthStatus.signedIn, mid: '1', isVip: true),
+      );
+      expect(
+        await harness.controller.send(
+          'member',
+          mode: 4,
+          color: 0x123456,
+          colorful: true,
+        ),
+        isTrue,
+      );
+      expect(harness.repository.colorful, isTrue);
+      expect(harness.session.sentColorful, [true]);
+      expect(harness.session.sent.single.color, 0xffffff);
+    },
+  );
+
+  test(
+    'expired membership during a PGC write cannot echo the previous result',
+    () async {
+      final harness = _Harness();
+      addTearDown(harness.dispose);
+      harness.auth.emit(
+        const AuthState(status: AuthStatus.signedIn, mid: '1', isVip: true),
+      );
+      harness.repository.pending = Completer<void>();
+      final sending = harness.controller.send(
+        'member',
+        mode: 1,
+        color: 0xffffff,
+        colorful: true,
+      );
+      harness.auth.emit(const AuthState(status: AuthStatus.signedIn, mid: '1'));
+      harness.repository.pending!.complete();
+      expect(await sending, isFalse);
+      expect(harness.session.sent, isEmpty);
+      expect(harness.repository.calls, 1);
+    },
+  );
+  test(
+    'writes only after explicit action and fixes target, text and milliseconds',
+    () async {
+      final harness = _Harness();
+      addTearDown(harness.dispose);
+      final controller = harness.controller;
+      expect(harness.repository.calls, 0);
+      expect(await controller.send(' ', mode: 1, color: 0xffffff), false);
+      harness.repository.pending = Completer<void>();
+      final sending = controller.send('  你好 & + %  ', mode: 5, color: 0x123456);
+      expect(harness.repository.calls, 1);
+      expect(harness.repository.target, _target);
+      expect(harness.repository.text, '你好 & + %');
+      expect(harness.repository.position, const Duration(milliseconds: 12345));
+      expect(harness.repository.mode, 5);
+      expect(harness.repository.color, 0x123456);
+      expect(
+        await controller.send('duplicate', mode: 1, color: 0xffffff),
+        false,
+      );
+      harness.repository.pending!.complete();
+      expect(await sending, true);
+      expect(harness.session.sent, [
+        (id: '9007199254740993', text: '你好 & + %', mode: 5, color: 0x123456),
+      ]);
+      expect(harness.state.busy, false);
+      expect(harness.state.message, '弹幕已发送');
+    },
+  );
+
+  test(
+    'wrong episode, unresolved media and source account reject before write',
+    () async {
+      final harness = _Harness();
+      addTearDown(harness.dispose);
+      harness.session.contentTarget = const PgcPlaybackTarget('8', cid: '101');
+      expect(
+        await harness.controller.send(
+          'wrong episode',
+          mode: 1,
+          color: 0xffffff,
+        ),
+        false,
+      );
+      harness.session.contentTarget = const PgcPlaybackTarget('7', cid: '101');
+      harness.session.isResolving = true;
+      expect(
+        await harness.controller.send('not ready', mode: 1, color: 0xffffff),
+        false,
+      );
+      harness.session.isResolving = false;
+      harness.session.sourceAccountScope = 'user:2';
+      expect(
+        await harness.controller.send('old account', mode: 1, color: 0xffffff),
+        false,
+      );
+      expect(harness.repository.calls, 0);
+    },
+  );
+
+  test(
+    'source changes cancel one pending write and reject its late result',
+    () async {
+      final harness = _Harness();
+      addTearDown(harness.dispose);
+      harness.repository.pending = Completer<void>();
+      final sending = harness.controller.send(
+        'old source',
+        mode: 1,
+        color: 0xffffff,
+      );
+      final cancellation = harness.repository.cancellation!;
+      harness.session.switchEpisode('8', '102');
+      expect(cancellation.isCancelled, true);
+      expect(harness.state.busy, false);
+      harness.repository.pending!.complete();
+      expect(await sending, false);
+      expect(harness.session.sent, isEmpty);
+      expect(harness.state.message, isNull);
+      expect(harness.repository.calls, 1);
+    },
+  );
+
+  test('same account epoch change invalidates pending send', () async {
+    final harness = _Harness();
+    addTearDown(harness.dispose);
+    harness.repository.pending = Completer<void>();
+    final sending = harness.controller.send(
+      'old epoch',
+      mode: 1,
+      color: 0xffffff,
+    );
+    harness.repository.sessionEpoch++;
+    harness.auth.emit(const AuthState(status: AuthStatus.signedIn, mid: '1'));
+    await Future<void>.delayed(Duration.zero);
+    expect(harness.repository.cancellation!.isCancelled, true);
+    harness.repository.pending!.complete();
+    expect(await sending, false);
+    expect(harness.state.message, isNull);
+  });
+
+  test('unknown write outcome never retries or claims success', () async {
+    final harness = _Harness();
+    addTearDown(harness.dispose);
+    harness.repository.failure = const PgcDanmakuWriteUncertain();
+    expect(
+      await harness.controller.send('maybe sent', mode: 1, color: 0xffffff),
+      false,
+    );
+    expect(harness.state.uncertain, true);
+    expect(harness.state.message, contains('未自动重试'));
+    expect(
+      await harness.controller.send('maybe sent', mode: 1, color: 0xffffff),
+      false,
+    );
+    expect(harness.repository.calls, 1);
+    expect(harness.session.sent, isEmpty);
+  });
+
+  testWidgets('PGC style survives composer replacement before sending', (
+    tester,
+  ) async {
+    final harness = _Harness();
+    addTearDown(harness.dispose);
+    await _pumpComposer(tester, harness);
+    await tester.tap(find.byTooltip('发送弹幕样式'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('底部'));
+    await tester.tap(find.byTooltip('蓝色'));
+    await tester.tap(find.text('完成'));
+    await tester.pumpAndSettle();
+    expect(harness.settings.value.danmakuSendStyle, (
+      mode: 4,
+      color: 0x00a1d6,
+      colorful: false,
+    ));
+    await _pumpComposer(
+      tester,
+      harness,
+      composerKey: const ValueKey('fullscreen'),
+    );
+    await tester.enterText(find.byType(TextField), 'blue bottom');
+    await tester.tap(find.text('发送'));
+    await tester.pumpAndSettle();
+    expect(harness.repository.mode, 4);
+    expect(harness.repository.color, 0x00a1d6);
+    expect(harness.session.sent.single.mode, 4);
+    expect(harness.session.sent.single.color, 0x00a1d6);
+  });
+
+  testWidgets('guest composer requests login without writing', (tester) async {
+    final harness = _Harness(signedIn: false);
+    addTearDown(harness.dispose);
+    var logins = 0;
+    await _pumpComposer(tester, harness, onLogin: () => logins++);
+    await tester.enterText(find.byType(TextField), 'hello');
+    await tester.tap(find.text('发送'));
+    await tester.pump();
+    expect(logins, 1);
+    expect(harness.repository.calls, 0);
+  });
+
+  testWidgets(
+    'composer retains failed draft and clears only confirmed success',
+    (tester) async {
+      final harness = _Harness();
+      addTearDown(harness.dispose);
+      await _pumpComposer(tester, harness);
+      harness.repository.failure = const AppFailure(
+        AppFailureKind.permission,
+        '当前集禁止发送弹幕',
+      );
+      await tester.enterText(find.byType(TextField), 'draft');
+      await tester.tap(find.text('发送'));
+      await tester.pumpAndSettle();
+      expect(
+        tester.widget<TextField>(find.byType(TextField)).controller!.text,
+        'draft',
+      );
+      expect(find.text('当前集禁止发送弹幕'), findsOneWidget);
+      harness.repository.failure = null;
+      await tester.tap(find.text('发送'));
+      await tester.pumpAndSettle();
+      expect(
+        tester.widget<TextField>(find.byType(TextField)).controller!.text,
+        isEmpty,
+      );
+      expect(find.text('弹幕已发送'), findsOneWidget);
+    },
+  );
+
+  for (final width in [320.0, 800.0]) {
+    testWidgets('PGC composer fits width $width with large text', (
+      tester,
+    ) async {
+      tester.view.devicePixelRatio = 1;
+      tester.view.physicalSize = Size(width, 900);
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+      final harness = _Harness();
+      addTearDown(harness.dispose);
+      await _pumpComposer(tester, harness, textScale: 2);
+      expect(tester.takeException(), isNull);
+    });
+  }
+}
+
+Future<void> _pumpComposer(
+  WidgetTester tester,
+  _Harness harness, {
+  VoidCallback? onLogin,
+  double textScale = 1,
+  Key? composerKey,
+}) async {
+  await tester.pumpWidget(
+    UncontrolledProviderScope(
+      container: harness.container,
+      child: MaterialApp(
+        builder: AppNoticeHost.builder,
+        home: MediaQuery(
+          data: MediaQueryData(textScaler: TextScaler.linear(textScale)),
+          child: Scaffold(
+            backgroundColor: Colors.black,
+            body: PgcDanmakuComposer(
+              key: composerKey,
+              episode: _episode,
+              onLogin: onLogin ?? () {},
+            ),
+          ),
+        ),
+      ),
+    ),
+  );
+  await tester.pumpAndSettle();
+}
+
+final class _Harness {
+  _Harness({bool signedIn = true}) {
+    auth = _Auth(signedIn);
+    container = ProviderContainer(
+      overrides: [
+        authRepositoryProvider.overrideWithValue(auth),
+        pgcDanmakuRepositoryProvider.overrideWithValue(repository),
+        playbackSessionProvider.overrideWithValue(session),
+        settingsRepositoryProvider.overrideWithValue(settings),
+      ],
+    );
+    container.listen(pgcDanmakuControllerProvider(_target), (_, _) {});
+  }
+  final repository = _Repository();
+  final settings = MemorySettingsRepository();
+  final session = _Session();
+  late final _Auth auth;
+  late final ProviderContainer container;
+  PgcDanmakuController get controller =>
+      container.read(pgcDanmakuControllerProvider(_target).notifier);
+  PgcDanmakuState get state =>
+      container.read(pgcDanmakuControllerProvider(_target));
+  void dispose() {
+    container.dispose();
+    session.dispose();
+    auth.dispose();
+  }
+}
+
+final class _Repository implements PgcDanmakuRepository {
+  @override
+  String accountScope = 'user:1';
+  @override
+  int sessionEpoch = 1;
+  int calls = 0;
+  PgcDanmakuTarget? target;
+  String? text;
+  Duration? position;
+  int? mode, color;
+  bool? colorful;
+  RequestCancellation? cancellation;
+  Completer<void>? pending;
+  Object? failure;
+  @override
+  Future<String?> send(
+    PgcDanmakuTarget target,
+    String text,
+    Duration position, {
+    required int mode,
+    required int color,
+    bool colorful = false,
+    required RequestCancellation cancellation,
+  }) async {
+    calls++;
+    this.target = target;
+    this.text = text;
+    this.position = position;
+    this.mode = mode;
+    this.color = color;
+    this.colorful = colorful;
+    this.cancellation = cancellation;
+    if (failure case final error?) throw error;
+    await pending?.future;
+    return '9007199254740993';
+  }
+}
+
+final class _Session extends ChangeNotifier implements PlaybackSession {
+  @override
+  final danmakuSendStyle =
+      ValueNotifier<({int mode, int color, bool colorful})>((
+        mode: 1,
+        color: 0xffffff,
+        colorful: false,
+      ));
+  @override
+  void setDanmakuSendStyle(({int mode, int color, bool colorful}) style) =>
+      danmakuSendStyle.value = style;
+  final sentColorful = <bool>[];
+  final sent = <({String? id, String text, int mode, int color})>[];
+  @override
+  void showSentDanmaku({
+    required String cid,
+    required int generation,
+    required String text,
+    required Duration position,
+    required int mode,
+    required int color,
+    bool colorful = false,
+    String? id,
+  }) {
+    sentColorful.add(colorful);
+    sent.add((id: id, text: text, mode: mode, color: color));
+  }
+
+  @override
+  int sourceGeneration = 1;
+  @override
+  String sourceAccountScope = 'user:1';
+  @override
+  bool isResolving = false;
+  @override
+  ContentPlaybackTarget? contentTarget = const PgcPlaybackTarget(
+    '7',
+    cid: '101',
+  );
+  @override
+  String? get danmakuCid => (contentTarget as PgcPlaybackTarget?)?.cid;
+  @override
+  PlaybackMedia? media = const PlaybackMedia(
+    video: PlaybackTrack(urls: [], codec: '', bandwidth: 0),
+    audio: PlaybackTrack(urls: [], codec: '', bandwidth: 0),
+    quality: 80,
+    qualities: [80],
+    duration: Duration(minutes: 20),
+    headers: {},
+  );
+  @override
+  final snapshots = ValueNotifier(
+    const PlaybackSnapshot(
+      phase: PlaybackPhase.paused,
+      generation: 1,
+      position: Duration(milliseconds: 12345),
+      duration: Duration(minutes: 20),
+    ),
+  );
+  void switchEpisode(String id, String cid) {
+    sourceGeneration++;
+    contentTarget = PgcPlaybackTarget(id, cid: cid);
+    notifyListeners();
+  }
+
+  @override
+  void dispose() {
+    snapshots.dispose();
+    danmakuSendStyle.dispose();
+    super.dispose();
+  }
+
+  @override
+  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
+}
+
+final class _Auth implements AuthRepository {
+  _Auth(bool signedIn)
+    : current = AuthState(
+        status: signedIn ? AuthStatus.signedIn : AuthStatus.guest,
+        mid: signedIn ? '1' : null,
+      );
+  final _changes = StreamController<AuthState>.broadcast(sync: true);
+  @override
+  AuthState current;
+  @override
+  Stream<AuthState> get changes => _changes.stream;
+  void emit(AuthState value) {
+    current = value;
+    _changes.add(value);
+  }
+
+  void dispose() => unawaited(_changes.close());
+  @override
+  void cancelSignIn() {}
+  @override
+  Future<void> restore() async {}
+  @override
+  Future<void> signIn() async {}
+  @override
+  Future<void> signOut() async => emit(const AuthState());
+}

@@ -1,0 +1,393 @@
+import 'dart:async';
+import 'dart:io' show Platform;
+
+import 'package:flutter/material.dart';
+import 'package:flutter_inappwebview/flutter_inappwebview.dart';
+import 'package:path_provider/path_provider.dart';
+
+import '../../shared/ui/app_dialog.dart';
+import 'passport_web_cookies.dart';
+import 'passport_webview_environment.dart';
+
+bool passportWebLoginSupportedForPlatform(TargetPlatform platform) =>
+    switch (platform) {
+      TargetPlatform.android ||
+      TargetPlatform.iOS ||
+      TargetPlatform.windows ||
+      TargetPlatform.macOS => true,
+      _ => false,
+    };
+
+final class BrowserLoginCookie {
+  const BrowserLoginCookie(
+    this.name,
+    this.value,
+    this.domain,
+    this.path,
+    this.hostOnly,
+    this.secure,
+    this.expires,
+  );
+
+  factory BrowserLoginCookie.fromNative(
+    Cookie cookie, {
+    required bool windowsExpiryInSeconds,
+  }) {
+    final Object? value = cookie.value;
+    final secure = cookie.isSecure;
+    if (value is! String || secure == null) {
+      throw const FormatException('Incomplete native cookie metadata');
+    }
+    final domain = cookie.domain?.toLowerCase();
+    final expiresDate = cookie.expiresDate;
+    // Windows 0.7.0-beta.3 passes CDP's seconds through unchanged. Android
+    // and WKWebView return milliseconds; do not reinterpret those timestamps.
+    final expires = cookie.isSessionOnly == true || expiresDate == null
+        ? null
+        : DateTime.fromMillisecondsSinceEpoch(
+            windowsExpiryInSeconds ? expiresDate * 1000 : expiresDate,
+            isUtc: true,
+          );
+    return BrowserLoginCookie(
+      cookie.name,
+      value,
+      (domain ?? 'api.bilibili.com').replaceFirst(RegExp(r'^\.'), ''),
+      cookie.path ?? '/',
+      domain == null ||
+          (domain == 'api.bilibili.com' && !domain.startsWith('.')),
+      secure,
+      expires,
+    );
+  }
+  final String name;
+  final String value;
+  final String domain;
+  final String path;
+  final bool hostOnly;
+  final bool secure;
+  final DateTime? expires;
+}
+
+Future<List<BrowserLoginCookie>?> showPassportWebLogin(BuildContext context) {
+  // WebView event logging can include authenticated URLs and Cookie values.
+  PlatformInAppWebViewController.debugLoggingSettings.enabled = false;
+  return showAppDialog<List<BrowserLoginCookie>>(
+    context: context,
+    barrierDismissible: false,
+    builder: (_) => const _PassportDialog(),
+  );
+}
+
+class _PassportDialog extends StatefulWidget {
+  const _PassportDialog();
+  @override
+  State<_PassportDialog> createState() => _PassportDialogState();
+}
+
+class _PassportDialogState extends State<_PassportDialog>
+    with WidgetsBindingObserver {
+  PassportWebViewEnvironment? _environment;
+  InAppWebViewController? _controller;
+  InAppWebView? _webView;
+  Timer? _poll;
+  Timer? _timeout;
+  bool _ready = false;
+  Future<void>? _captureOperation;
+  bool _paused = false;
+  bool _finished = false;
+  int _navigationGeneration = 0;
+  String? _error;
+  String? _pageError;
+  String _userAgent = '';
+  final _cookieReader = PassportWebCookieReader();
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _timeout = Timer(
+      const Duration(minutes: 10),
+      () => _fail('登录页面已超时，请关闭后重试'),
+    );
+    unawaited(_initialize());
+  }
+
+  Future<void> _initialize() async {
+    try {
+      _userAgent = await _cookieReader.createUserAgent();
+      if (Platform.isAndroid &&
+          !await WebViewFeature.isFeatureSupported(
+            WebViewFeature.GET_COOKIE_INFO,
+          )) {
+        _fail('请更新 Android System WebView 后使用密码／短信登录，或使用扫码登录');
+        return;
+      }
+      PassportWebViewEnvironment? environment;
+      if (Platform.isWindows) {
+        if (await WebViewEnvironment.getAvailableVersion() == null) {
+          _fail('网页登录需要 Microsoft Edge WebView2 Runtime，请安装后重试或使用扫码登录');
+          return;
+        }
+        environment = await PassportWebViewEnvironment.create(
+          await getApplicationSupportDirectory(),
+        );
+      }
+      if (!mounted || _finished || _error != null) {
+        await environment?.dispose();
+        return;
+      }
+      setState(() {
+        _environment = environment;
+        _ready = true;
+      });
+      _poll = Timer.periodic(
+        const Duration(seconds: 2),
+        (_) => unawaited(_capture()),
+      );
+    } catch (_) {
+      _fail(
+        Platform.isWindows
+            ? '无法创建网页登录窗口。若以管理员权限运行，请关闭应用后以普通权限重新启动；也可使用扫码登录。'
+            : '无法打开网页登录，请重试或使用扫码登录',
+      );
+    }
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    _paused = state != AppLifecycleState.resumed;
+    if (state == AppLifecycleState.resumed) unawaited(_capture());
+  }
+
+  void _fail(String message) {
+    if (mounted && !_finished) setState(() => _error = message);
+  }
+
+  Future<void> _capture() {
+    // Error callbacks must await a read already in flight before deciding that
+    // login failed. Starting a second read can also race native view disposal.
+    return _captureOperation ??= _readCookies().whenComplete(
+      () => _captureOperation = null,
+    );
+  }
+
+  Future<void> _readCookies() async {
+    final controller = _controller;
+    if (controller == null || _paused || _finished || _error != null) {
+      return;
+    }
+    try {
+      // Fetch cookies applicable to the API root, retaining their native scope.
+      final cookies = await _cookieReader
+          .read(controller, environment: _environment?.environment)
+          .timeout(const Duration(seconds: 10));
+      if (!mounted ||
+          _paused ||
+          _finished ||
+          _error != null ||
+          !cookies.any(
+            (cookie) =>
+                cookie.name == 'SESSDATA' &&
+                cookie.value is String &&
+                (cookie.value as String).isNotEmpty,
+          )) {
+        return;
+      }
+      final result = <BrowserLoginCookie>[];
+      for (final cookie in cookies) {
+        result.add(
+          BrowserLoginCookie.fromNative(
+            cookie,
+            windowsExpiryInSeconds:
+                _cookieReader.platform == TargetPlatform.windows,
+          ),
+        );
+      }
+      _finished = true;
+      Navigator.pop(context, List<BrowserLoginCookie>.unmodifiable(result));
+    } on FormatException {
+      _fail('当前系统 WebView 无法读取完整会话信息，请更新后重试或使用扫码登录');
+    } catch (_) {
+      _fail('无法读取网页登录会话，请重试或使用扫码登录');
+    }
+  }
+
+  void _pageLoadedOrStarted() {
+    _navigationGeneration++;
+    if (mounted && !_finished && _pageError != null) {
+      setState(() => _pageError = null);
+    }
+    unawaited(_capture());
+  }
+
+  Future<void> _pageFailed(
+    WebResourceRequest request,
+    WebResourceError error,
+  ) async {
+    if (request.isForMainFrame != true) return;
+    if (error.type == WebResourceErrorType.CANCELLED) {
+      // WebView2/WKWebView report superseded or policy-cancelled navigation as
+      // an error too. It does not invalidate cookies created by the login POST.
+      await _capture();
+      return;
+    }
+    final generation = _navigationGeneration;
+    await _capture();
+    if (mounted &&
+        !_finished &&
+        _error == null &&
+        generation == _navigationGeneration) {
+      setState(() => _pageError = '登录页面加载失败，请检查网络后重试');
+    }
+  }
+
+  Future<void> _retryPage() async {
+    await _capture();
+    if (!mounted || _finished || _error != null) return;
+    _pageLoadedOrStarted();
+    try {
+      // Reloading the failed navigation can replay a password/SMS form POST.
+      // An explicit retry always opens the original login page with a GET.
+      await _controller?.loadUrl(
+        urlRequest: URLRequest(
+          url: WebUri('https://passport.bilibili.com/login'),
+          method: 'GET',
+        ),
+      );
+    } catch (_) {
+      if (mounted && !_finished && _error == null) {
+        setState(() => _pageError = '登录页面加载失败，请检查网络后重试');
+      }
+    }
+  }
+
+  @override
+  void dispose() {
+    _finished = true;
+    _poll?.cancel();
+    _timeout?.cancel();
+    WidgetsBinding.instance.removeObserver(this);
+    // Remove the native view before releasing its environment/profile.
+    final environment = _environment;
+    if (environment != null) {
+      unawaited(_releaseEnvironment(environment));
+    }
+    super.dispose();
+  }
+
+  Future<void> _releaseEnvironment(
+    PassportWebViewEnvironment environment,
+  ) async {
+    await WidgetsBinding.instance.endOfFrame;
+    try {
+      await environment.dispose();
+    } catch (_) {
+      // Closing the dialog must not surface a native shutdown exception.
+      // Do not log the exception: plugin errors can contain private paths.
+      debugPrint('passport_webview: environment shutdown failed');
+    }
+  }
+
+  InAppWebView _createWebView() => InAppWebView(
+    webViewEnvironment: _environment?.environment,
+    initialUrlRequest: URLRequest(
+      url: WebUri('https://passport.bilibili.com/login'),
+    ),
+    initialSettings: InAppWebViewSettings(
+      incognito: true,
+      userAgent: _userAgent,
+      generalAutofillEnabled: false,
+      passwordAutosaveEnabled: false,
+      isInspectable: false,
+      sharedCookiesEnabled: false,
+      useShouldOverrideUrlLoading: true,
+      javaScriptBridgeEnabled: false,
+    ),
+    onWebViewCreated: (controller) => _controller = controller,
+    onLoadStart: (_, _) => _pageLoadedOrStarted(),
+    onLoadStop: (_, _) => _pageLoadedOrStarted(),
+    onUpdateVisitedHistory: (_, _, _) => unawaited(_capture()),
+    shouldOverrideUrlLoading: (_, action) async {
+      final uri = action.request.url;
+      if (!action.isForMainFrame) return NavigationActionPolicy.ALLOW;
+      unawaited(_capture());
+      return uri != null &&
+              uri.scheme == 'https' &&
+              (uri.host == 'bilibili.com' || uri.host.endsWith('.bilibili.com'))
+          ? NavigationActionPolicy.ALLOW
+          : NavigationActionPolicy.CANCEL;
+    },
+    onReceivedError: (_, request, error) =>
+        unawaited(_pageFailed(request, error)),
+  );
+
+  @override
+  Widget build(BuildContext context) => PopScope<List<BrowserLoginCookie>>(
+    onPopInvokedWithResult: (didPop, _) {
+      // A popped route stays mounted during its closing animation.
+      if (didPop) _finished = true;
+    },
+    child: Dialog(
+      insetPadding: const EdgeInsets.all(8),
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(maxWidth: 860, maxHeight: 720),
+        child: Column(
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 8, 4, 8),
+              child: Row(
+                children: [
+                  const Expanded(child: Text('哔哩哔哩官网登录')),
+                  IconButton(
+                    tooltip: '关闭网页登录',
+                    onPressed: () => Navigator.pop(context),
+                    icon: const Icon(Icons.close),
+                  ),
+                ],
+              ),
+            ),
+            Expanded(
+              child: _error != null
+                  ? Center(
+                      child: SingleChildScrollView(
+                        padding: const EdgeInsets.all(20),
+                        child: Text(_error!, textAlign: TextAlign.center),
+                      ),
+                    )
+                  : !_ready
+                  ? const Center(child: CircularProgressIndicator())
+                  : Stack(
+                      fit: StackFit.expand,
+                      children: [
+                        // The platform delegate owns the native controller.
+                        // Keep both identities stable while showing errors.
+                        _webView ??= _createWebView(),
+                        if (_pageError case final message?)
+                          ColoredBox(
+                            color: Theme.of(context).colorScheme.surface,
+                            child: Center(
+                              child: SingleChildScrollView(
+                                padding: const EdgeInsets.all(20),
+                                child: Column(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    Text(message, textAlign: TextAlign.center),
+                                    const SizedBox(height: 12),
+                                    TextButton(
+                                      onPressed: () => unawaited(_retryPage()),
+                                      child: const Text('重新打开登录页'),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ),
+                          ),
+                      ],
+                    ),
+            ),
+          ],
+        ),
+      ),
+    ),
+  );
+}

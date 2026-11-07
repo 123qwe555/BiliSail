@@ -1,0 +1,274 @@
+import 'dart:async';
+
+/// Headers are held only for the active source. Do not log or serialize this.
+final class MediaRequestPolicy {
+  MediaRequestPolicy({Map<String, String> headers = const {}})
+    : headers = Map.unmodifiable(headers);
+
+  final Map<String, String> headers;
+}
+
+final class MediaTrack {
+  const MediaTrack({
+    required this.uri,
+    required this.requestPolicy,
+    this.codec,
+    this.bandwidth,
+  });
+
+  final Uri uri;
+  final MediaRequestPolicy requestPolicy;
+  final String? codec;
+  final int? bandwidth;
+}
+
+sealed class ResolvedMediaSource {
+  const ResolvedMediaSource();
+}
+
+final class ProgressiveSource extends ResolvedMediaSource {
+  const ProgressiveSource(
+    this.media, {
+    this.isAudioOnly = false,
+    this.isLive = false,
+  });
+  final MediaTrack media;
+  final bool isLive;
+
+  /// The resolver confirmed an independent audio resource. Opening this source
+  /// must not attach a video output or depend on Flutter producing a frame.
+  final bool isAudioOnly;
+}
+
+/// Video and audio are separate resources. Null audio is only valid when the
+/// resolver has positively identified an intentionally silent source.
+final class DashPairSource extends ResolvedMediaSource {
+  const DashPairSource({
+    required this.video,
+    required this.audio,
+    this.isIntentionallySilent = false,
+  });
+
+  final MediaTrack video;
+  final MediaTrack? audio;
+  final bool isIntentionallySilent;
+}
+
+/// A video representation with audio deliberately omitted for a muted preview.
+/// This is distinct from a regular DASH pair with missing companion audio.
+final class DashVideoSource extends ResolvedMediaSource {
+  const DashVideoSource(this.video);
+  final MediaTrack video;
+}
+
+/// An HLS or similar media manifest supplied by a resolver.
+final class ManifestSource extends ResolvedMediaSource {
+  const ManifestSource(this.media, {this.isLive = false});
+  final MediaTrack media;
+  final bool isLive;
+}
+
+/// Automatic uses the platform decoder preference with a safe fallback.
+enum VideoDecodingMode { automatic, software }
+
+/// Android decoder output; foreground widgets keep using Flutter composition.
+enum AndroidVideoOutputMode { renderedTexture, directTexture }
+
+final class OpenOptions {
+  static const maximumBufferAhead = Duration(minutes: 2);
+
+  const OpenOptions({
+    this.startPosition = Duration.zero,
+    this.play = false,
+    this.rate = 1,
+    this.volume = 100,
+    this.audioGainDb = 0,
+    this.videoDecoding = VideoDecodingMode.automatic,
+    this.androidVideoOutput = AndroidVideoOutputMode.renderedTexture,
+    this.openTimeout = const Duration(seconds: 35),
+    this.maxBufferAhead = maximumBufferAhead,
+  });
+  final Duration startPosition;
+  final bool play;
+  final double rate;
+  final double volume;
+
+  /// Source normalization gain, independent of the user's volume percentage.
+  final double audioGainDb;
+  final VideoDecodingMode videoDecoding;
+  final AndroidVideoOutputMode androidVideoOutput;
+  final Duration openTimeout;
+
+  /// Rolling forward demuxer window in media time, at most two minutes.
+  /// Must be positive. Memory capacity may stop buffering earlier, and
+  /// packet/I/O boundaries may slightly overshoot the time window.
+  final Duration maxBufferAhead;
+}
+
+enum PlaybackPhase {
+  idle,
+  opening,
+  ready,
+  playing,
+  paused,
+  buffering,
+  ended,
+  failed,
+  disposed,
+}
+
+/// Display dimensions after pixel-aspect correction and metadata rotation.
+final class VideoDimensions {
+  const VideoDimensions(this.width, this.height);
+
+  final int width;
+  final int height;
+
+  @override
+  bool operator ==(Object other) =>
+      other is VideoDimensions &&
+      width == other.width &&
+      height == other.height;
+
+  @override
+  int get hashCode => Object.hash(width, height);
+}
+
+final class PlaybackSnapshot {
+  const PlaybackSnapshot({
+    required this.phase,
+    required this.generation,
+    this.position = Duration.zero,
+    this.duration = Duration.zero,
+    this.buffered = Duration.zero,
+    this.desiredPlaying = false,
+    this.isBuffering = false,
+    this.isSeeking = false,
+    this.rate = 1,
+    this.volume = 100,
+    this.videoDimensions,
+  });
+
+  final PlaybackPhase phase;
+  final int generation;
+  final Duration position;
+  final Duration duration;
+  final Duration buffered;
+  final bool desiredPlaying;
+  final bool isBuffering;
+  final bool isSeeking;
+  final double rate;
+
+  /// Native backend scale: 0 to 100.
+  final double volume;
+
+  /// Null until this source reports valid decoded video dimensions.
+  final VideoDimensions? videoDimensions;
+
+  @override
+  bool operator ==(Object other) =>
+      other is PlaybackSnapshot &&
+      phase == other.phase &&
+      generation == other.generation &&
+      position == other.position &&
+      duration == other.duration &&
+      buffered == other.buffered &&
+      desiredPlaying == other.desiredPlaying &&
+      isBuffering == other.isBuffering &&
+      isSeeking == other.isSeeking &&
+      rate == other.rate &&
+      volume == other.volume &&
+      videoDimensions == other.videoDimensions;
+
+  @override
+  int get hashCode => Object.hash(
+    phase,
+    generation,
+    position,
+    duration,
+    buffered,
+    desiredPlaying,
+    isBuffering,
+    isSeeking,
+    rate,
+    volume,
+    videoDimensions,
+  );
+
+  PlaybackSnapshot copyWith({
+    PlaybackPhase? phase,
+    int? generation,
+    Duration? position,
+    Duration? duration,
+    Duration? buffered,
+    bool? desiredPlaying,
+    bool? isBuffering,
+    bool? isSeeking,
+    double? rate,
+    double? volume,
+    VideoDimensions? videoDimensions,
+  }) => PlaybackSnapshot(
+    phase: phase ?? this.phase,
+    generation: generation ?? this.generation,
+    position: position ?? this.position,
+    duration: duration ?? this.duration,
+    buffered: buffered ?? this.buffered,
+    desiredPlaying: desiredPlaying ?? this.desiredPlaying,
+    isBuffering: isBuffering ?? this.isBuffering,
+    isSeeking: isSeeking ?? this.isSeeking,
+    rate: rate ?? this.rate,
+    volume: volume ?? this.volume,
+    videoDimensions: videoDimensions ?? this.videoDimensions,
+  );
+}
+
+enum PlayerFailureKind {
+  invalidSource,
+  unsupportedHeaders,
+  unsupportedVideoColor,
+  nativePlayback,
+  nativeProcessExited,
+  videoInterrupted,
+  disposed,
+}
+
+final class PlayerFailure implements Exception {
+  const PlayerFailure(this.kind, this.message, this.generation);
+  final PlayerFailureKind kind;
+
+  /// Static, safe text only; never include native errors, URLs or headers.
+  final String message;
+  final int generation;
+
+  @override
+  String toString() => 'PlayerFailure($kind: $message)';
+}
+
+final class PlayerCapabilities {
+  const PlayerCapabilities({
+    required this.externalAudio,
+    required this.externalAudioHeaders,
+  });
+  final bool externalAudio;
+  final bool externalAudioHeaders;
+}
+
+abstract interface class PlayerEngine {
+  Stream<PlaybackSnapshot> get snapshots;
+  Stream<PlayerFailure> get failures;
+  PlaybackSnapshot get currentSnapshot;
+  PlayerCapabilities get capabilities;
+  Future<void> open(ResolvedMediaSource source, OpenOptions options);
+  Future<void> play();
+  Future<void> pause();
+  Future<void> seek(Duration target);
+  Future<void> setRate(double rate);
+  Future<void> setVolume(double volume);
+  Future<void> stop();
+  Future<void> dispose();
+}
+
+/// Optional native gain control; changing gain must not reopen media.
+abstract interface class AudioGainControl {
+  Future<void> setAudioGain(double gainDb);
+}

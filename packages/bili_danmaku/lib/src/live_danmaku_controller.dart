@@ -1,0 +1,496 @@
+import 'dart:collection';
+
+import 'package:flutter/foundation.dart';
+import 'package:flutter/painting.dart';
+
+import 'danmaku_controller.dart' show DanmakuMode;
+import 'danmaku_text_style.dart';
+import 'danmaku_layers.dart';
+
+@immutable
+final class LiveDanmakuEvent {
+  const LiveDanmakuEvent({
+    required this.id,
+    required this.text,
+    this.mode = DanmakuMode.scroll,
+    this.color = const Color(0xffffffff),
+    this.fontSize = 24,
+  });
+  final String id, text;
+  final DanmakuMode mode;
+  final Color color;
+  final double fontSize;
+}
+
+@immutable
+final class LiveDanmakuPlacement {
+  const LiveDanmakuPlacement(this.event, this.x, this.y);
+  final LiveDanmakuEvent event;
+  final double x, y;
+}
+
+final class _Received {
+  const _Received(this.event, this.at);
+  final LiveDanmakuEvent event;
+  final Duration at;
+}
+
+final class _Visible {
+  const _Visible(this.event, this.at, this.width, this.height, this.lane);
+  final LiveDanmakuEvent event;
+  final Duration at;
+  final double width;
+  final double height;
+  final int lane;
+}
+
+/// Live time advances from message receipt using a monotonic wall clock.
+/// It has no player position, seek, buffering or playback rate dependency.
+final class LiveDanmakuController extends ChangeNotifier
+    implements LayeredDanmakuController {
+  LiveDanmakuController({
+    required Duration Function() monotonicNow,
+    this.maxPending = 500,
+    this.maxVisible = 120,
+    this.maxTextLayouts = 256,
+    this.maxAdmissionsPerFrame = 32,
+    this.scrollDuration = const Duration(seconds: 8),
+    this.fixedDuration = const Duration(seconds: 4),
+    this.maxPendingAge = const Duration(seconds: 2),
+  }) : assert(maxAdmissionsPerFrame > 0),
+       _now = monotonicNow;
+
+  final Duration Function() _now;
+  final int maxPending, maxVisible, maxTextLayouts;
+  final int maxAdmissionsPerFrame;
+  final Duration scrollDuration, fixedDuration, maxPendingAge;
+  final Queue<_Received> _pending = Queue();
+  final List<_Visible> _visible = [];
+  bool _rasterProtectionDirty = false;
+  int _laneIndexBuildCount = 0;
+  int _rasterProtectionUpdateCount = 0;
+  int _visualRevision = 0;
+
+  /// Changes to visible content or layout, separate from message notifications.
+  @override
+  int get visualRevision => _visualRevision;
+  late final _layouts = DanmakuTextLayouts(maxTextLayouts);
+  final Map<String, Duration> _recentIds = {};
+  bool _enabled = true;
+  double _width = 0, _height = 0, _bottomInset = 0, _area = .75, _speed = 1;
+  double _topInset = 0;
+  double _lineSpacing = 5;
+  Duration _offset = Duration.zero;
+  bool _mergeDuplicates = false;
+  int _maxOnScreen = 0;
+  double get _top => _topInset.clamp(0, _height - _bottomInset);
+  double get _availableHeight => (_height - _bottomInset - _top) * _area;
+  // Match admission and resize capacity without truncating tall/small-text
+  // layouts to 24 rows. The visible-item budget keeps the index bounded.
+  int get _laneCount =>
+      (_availableHeight / _laneHeight).floor().clamp(0, maxVisible);
+  double _laneHeight = DanmakuTextLayouts.minFontSize + 5;
+  int _maxPerSecond = 20, _windowCount = 0;
+  Duration _windowAt = Duration.zero;
+  int dropped = 0;
+  int get pendingCount => _pending.length;
+  int get visibleCount => _visible.length;
+  int get textLayoutCount => _layouts.length;
+  int get textLayoutBuildCount => _layouts.buildCount;
+  int get textRasterBytes => _layouts.rasterBytes;
+  DanmakuRasterStatistics get rasterStatistics => _layouts.rasterStatistics;
+
+  @visibleForTesting
+  int get laneIndexBuildCount => _laneIndexBuildCount;
+
+  @visibleForTesting
+  int get rasterProtectionUpdateCount => _rasterProtectionUpdateCount;
+
+  bool get isAnimating =>
+      _enabled && (_pending.isNotEmpty || _visible.isNotEmpty);
+
+  /// Only moving, due or expired items require a frame immediately.
+  @override
+  bool get needsFrame => _needsFrameAt(_now());
+
+  bool _needsFrameAt(Duration now) {
+    if (!_enabled || _width <= 0 || _height <= 0) return false;
+    if (_pending.isNotEmpty && _pending.first.at <= now) return true;
+    return _visible.any(
+      (item) =>
+          item.event.mode == DanmakuMode.scroll ||
+          now - item.at >= fixedDuration,
+    );
+  }
+
+  /// A delayed arrival or stationary expiry needs one wake, not a running ticker.
+  @override
+  Duration? get nextFrameDelay {
+    final now = _now();
+    if (!_enabled || _width <= 0 || _height <= 0 || _needsFrameAt(now)) {
+      return null;
+    }
+    Duration? delay = _pending.isEmpty ? null : _pending.first.at - now;
+    for (final item in _visible) {
+      final untilExpiry = item.at + fixedDuration - now;
+      if (delay == null || untilExpiry < delay) delay = untilExpiry;
+    }
+    return delay;
+  }
+
+  Duration get _scrollLifetime =>
+      Duration(microseconds: (scrollDuration.inMicroseconds / _speed).round());
+
+  /// [topInset] reserves logical pixels before applying [area].
+  /// [lineSpacing] adds 0–100 logical pixels after measured text height.
+  /// The default gap is 5 pixels.
+  void configure({
+    required double area,
+    required double speed,
+    required int maxPerSecond,
+    double topInset = 0,
+    double lineSpacing = 5,
+    Duration offset = Duration.zero,
+    bool mergeDuplicates = false,
+    int maxOnScreen = 0,
+    DanmakuTextStyle textStyle = const DanmakuTextStyle(),
+  }) {
+    final nextArea = area.clamp(.25, 1.0), nextSpeed = speed.clamp(.5, 2.0);
+    final nextTopInset = topInset.isFinite
+        ? topInset.clamp(0.0, double.infinity)
+        : 0.0;
+    final nextLineSpacing = lineSpacing.isFinite
+        ? lineSpacing.clamp(0.0, 100.0)
+        : 5.0;
+    final nextMaxPerSecond = maxPerSecond.clamp(0, 100);
+    if (_area != nextArea ||
+        _speed != nextSpeed ||
+        _topInset != nextTopInset ||
+        _lineSpacing != nextLineSpacing ||
+        _offset != offset ||
+        _mergeDuplicates != mergeDuplicates ||
+        _maxOnScreen != maxOnScreen.clamp(0, maxVisible) ||
+        _layouts.style != textStyle ||
+        _maxPerSecond != nextMaxPerSecond) {
+      _area = nextArea;
+      _speed = nextSpeed;
+      _topInset = nextTopInset;
+      _lineSpacing = nextLineSpacing;
+      _offset = offset;
+      _mergeDuplicates = mergeDuplicates;
+      _maxOnScreen = maxOnScreen.clamp(0, maxVisible);
+      _maxPerSecond = nextMaxPerSecond;
+      _laneHeight = DanmakuTextLayouts.minFontSize + _lineSpacing;
+      _clearLayouts();
+      _layouts.style = textStyle;
+      clear();
+    }
+  }
+
+  void setEnabled(bool enabled) {
+    if (_enabled == enabled) return;
+    _enabled = enabled;
+    clear();
+  }
+
+  void clear() {
+    _pending.clear();
+    _visible.clear();
+    _visualRevision++;
+    _rasterProtectionDirty = true;
+    _recentIds.clear();
+    _windowCount = 0;
+    _windowAt = _now();
+    notifyListeners();
+  }
+
+  void add(Iterable<LiveDanmakuEvent> events) {
+    if (!_enabled) return;
+    final now = _now();
+    if (now - _windowAt >= const Duration(seconds: 1)) {
+      _windowAt = now;
+      _windowCount = 0;
+    }
+    for (final event in events.take(maxPending)) {
+      if (event.text.isEmpty ||
+          event.text.length > 300 ||
+          !event.fontSize.isFinite ||
+          event.fontSize <= 0 ||
+          _recentIds.containsKey(event.id)) {
+        continue;
+      }
+      if (_maxPerSecond > 0 && _windowCount >= _maxPerSecond) {
+        dropped++;
+        continue;
+      }
+      _windowCount++;
+      _recentIds[event.id] = now;
+      if (_pending.length >= maxPending) {
+        _pending.removeFirst();
+        dropped++;
+      }
+      // Live messages have no past media clock: negative offsets are immediate.
+      _pending.add(
+        _Received(
+          event,
+          now + (_offset > Duration.zero ? _offset : Duration.zero),
+        ),
+      );
+    }
+    _recentIds.removeWhere((_, at) => now - at > const Duration(seconds: 30));
+    while (_recentIds.length > maxPending) {
+      _recentIds.remove(_recentIds.keys.first);
+    }
+    notifyListeners();
+  }
+
+  @override
+  void setViewport({
+    required double width,
+    required double height,
+    double bottomInset = 0,
+  }) {
+    final nextWidth = width.clamp(0.0, double.infinity);
+    final nextHeight = height.clamp(0.0, double.infinity);
+    final nextBottomInset = bottomInset.clamp(0.0, nextHeight);
+    if (_width == nextWidth &&
+        _height == nextHeight &&
+        _bottomInset == nextBottomInset) {
+      return;
+    }
+    _width = nextWidth;
+    _height = nextHeight;
+    _bottomInset = nextBottomInset;
+    _visualRevision++;
+    if (_width > 0 && _height > 0) {
+      // Text shaping and rasters do not depend on viewport size. Keep arrival
+      // times and project scroll progress onto the new width in frame().
+      final lanes = _laneCount;
+      _removeVisibleWhere((item) => item.lane >= lanes);
+    }
+    notifyListeners();
+  }
+
+  TextPainter _layout(LiveDanmakuEvent event) =>
+      _layouts.layout(event.text, event.color, event.fontSize);
+
+  void paintText(
+    LiveDanmakuEvent event,
+    Canvas canvas,
+    Offset offset, {
+    double pixelRatio = 1,
+  }) => _layouts.paint(
+    event.text,
+    event.color,
+    event.fontSize,
+    canvas,
+    offset,
+    pixelRatio: pixelRatio,
+  );
+
+  @override
+  late final paintLayers = DanmakuPaintLayers(_layouts);
+
+  /// Prepares both paint layers in one bounded admission pass.
+  @override
+  void preparePaintLayers() {
+    paintLayers.beginFrame();
+    try {
+      _visitFrame((event, x, y) {
+        paintLayers.add(
+          scrolling: event.mode == DanmakuMode.scroll,
+          text: event.text,
+          color: event.color,
+          fontSize: event.fontSize,
+          x: x,
+          y: y,
+        );
+      });
+    } finally {
+      paintLayers.endFrame();
+    }
+  }
+
+  void _clearLayouts() => _layouts.clear();
+
+  void _removeVisibleWhere(bool Function(_Visible) test) {
+    final previousLength = _visible.length;
+    _visible.removeWhere(test);
+    if (_visible.length != previousLength) {
+      _rasterProtectionDirty = true;
+      _visualRevision++;
+    }
+  }
+
+  List<LiveDanmakuPlacement> frame() {
+    final result = <LiveDanmakuPlacement>[];
+    _visitFrame((event, x, y) {
+      result.add(LiveDanmakuPlacement(event, x, y));
+    });
+    return result;
+  }
+
+  /// Paint the current receipt-clock frame in arrival order without building
+  /// an intermediate position list. The caller owns clipping.
+  void paintFrame(Canvas canvas, {double pixelRatio = 1}) {
+    final ratio = pixelRatio.isFinite && pixelRatio > 0 ? pixelRatio : 1.0;
+    _layouts.beginFrame(canvas, ratio);
+    try {
+      _visitFrame((event, x, y) {
+        paintText(event, canvas, Offset(x, y), pixelRatio: ratio);
+      });
+    } finally {
+      _layouts.endFrame();
+    }
+  }
+
+  void _visitFrame(void Function(LiveDanmakuEvent, double, double) visit) {
+    if (!_enabled) return;
+    final now = _now();
+    final nowMicros = now.inMicroseconds;
+    final scrollMicros = _scrollLifetime.inMicroseconds;
+    final fixedMicros = fixedDuration.inMicroseconds;
+    _removeVisibleWhere(
+      (item) =>
+          nowMicros - item.at.inMicroseconds >=
+          (item.event.mode == DanmakuMode.scroll ? scrollMicros : fixedMicros),
+    );
+    if (_width <= 0 || _height <= 0) return;
+    // Keep the receipt clock moving every frame; only arrivals need an index.
+    if (_pending.isNotEmpty && _pending.first.at <= now) _admit(now);
+    if (_rasterProtectionDirty) {
+      _layouts.protectRasters(
+        _visible.map(
+          (item) =>
+              (item.event.text, item.event.color, item.event.fontSize, false),
+        ),
+      );
+      _rasterProtectionDirty = false;
+      _rasterProtectionUpdateCount++;
+    }
+    final top = _top;
+    final bottom = top + _availableHeight;
+    for (final item in _visible) {
+      final x = item.event.mode == DanmakuMode.scroll
+          ? _width -
+                (_width + item.width) *
+                    ((nowMicros - item.at.inMicroseconds) / scrollMicros)
+          : (_width - item.width) / 2;
+      final y = item.event.mode == DanmakuMode.bottom
+          ? bottom - (item.lane + 1) * _laneHeight
+          : top + item.lane * _laneHeight;
+      visit(item.event, x, y);
+    }
+  }
+
+  void _admit(Duration now) {
+    final prepared = <(LiveDanmakuEvent, double, double)>[];
+    final texts = _mergeDuplicates
+        ? {for (final item in _visible) (item.event.mode, item.event.text)}
+        : <(DanmakuMode, String)>{};
+    while (_pending.isNotEmpty && _pending.first.at <= now) {
+      if (prepared.length >= maxAdmissionsPerFrame) break;
+      final received = _pending.removeFirst();
+      if (now - received.at > maxPendingAge ||
+          _visible.length >= (_maxOnScreen == 0 ? maxVisible : _maxOnScreen)) {
+        dropped++;
+        continue;
+      }
+      if (_mergeDuplicates &&
+          !texts.add((received.event.mode, received.event.text))) {
+        continue;
+      }
+      final layout = _layout(received.event);
+      prepared.add((received.event, layout.width, layout.height));
+    }
+    if (prepared.isEmpty) return;
+    var textHeight = _visible.isEmpty
+        ? DanmakuTextLayouts.minFontSize
+        : _laneHeight - _lineSpacing;
+    var occupiedLaneCount = 0;
+    for (final item in _visible) {
+      if (item.height > textHeight) textHeight = item.height;
+      if (item.lane >= occupiedLaneCount) occupiedLaneCount = item.lane + 1;
+    }
+    prepared.removeWhere((item) {
+      if (item.$3 <= textHeight) return false;
+      // A new font size must not reclaim rows still displaying older messages.
+      if ((_availableHeight / (item.$3 + _lineSpacing)).floor() <
+          occupiedLaneCount) {
+        dropped++;
+        return true;
+      }
+      textHeight = item.$3;
+      return false;
+    });
+    _laneHeight = textHeight + _lineSpacing;
+    final laneCount = _laneCount;
+    _removeVisibleWhere((item) => item.lane >= laneCount);
+    _laneIndexBuildCount++;
+    final lanes = List.generate(
+      DanmakuMode.values.length,
+      (_) => List.generate(laneCount, (_) => <_Visible>[]),
+    );
+    for (final item in _visible) {
+      lanes[item.event.mode.index][item.lane].add(item);
+    }
+    for (final (event, width, height) in prepared) {
+      if (_visible.length >= (_maxOnScreen == 0 ? maxVisible : _maxOnScreen)) {
+        dropped++;
+        continue;
+      }
+      final lane = _findLane(event, width, now, lanes[event.mode.index]);
+      if (lane < 0) {
+        dropped++;
+        continue;
+      }
+      final item = _Visible(event, now, width, height, lane);
+      _visible.add(item);
+      _visualRevision++;
+      _rasterProtectionDirty = true;
+      lanes[event.mode.index][lane].add(item);
+    }
+  }
+
+  int _findLane(
+    LiveDanmakuEvent event,
+    double textWidth,
+    Duration now,
+    List<List<_Visible>> lanes,
+  ) {
+    for (var lane = 0; lane < lanes.length; lane++) {
+      var free = true;
+      for (final prior in lanes[lane]) {
+        if (event.mode != DanmakuMode.scroll) {
+          free = false;
+          break;
+        }
+        final oldSpeed =
+            (_width + prior.width) / _scrollLifetime.inMicroseconds;
+        final newSpeed = (_width + textWidth) / _scrollLifetime.inMicroseconds;
+        final elapsed = (now - prior.at).inMicroseconds;
+        final oldTail = _width - oldSpeed * elapsed + prior.width;
+        final remaining = (_scrollLifetime.inMicroseconds - elapsed).clamp(
+          0,
+          _scrollLifetime.inMicroseconds,
+        );
+        if (oldTail + 8 > _width ||
+            (newSpeed > oldSpeed &&
+                _width - newSpeed * remaining <
+                    oldTail - oldSpeed * remaining + 8)) {
+          free = false;
+          break;
+        }
+      }
+      if (free) return lane;
+    }
+    return -1;
+  }
+
+  @override
+  void dispose() {
+    paintLayers.clear();
+    _clearLayouts();
+    super.dispose();
+  }
+}

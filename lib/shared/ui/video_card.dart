@@ -1,0 +1,1006 @@
+import 'dart:async';
+
+import '../../domain/user.dart';
+import '../../features/comments/domain/comment_time.dart';
+import 'bili_icons.dart';
+import 'app_cover_image.dart';
+import 'bili_badges.dart';
+import 'highlighted_text.dart';
+import 'video_card_cover.dart';
+import 'video_card_interaction_scope.dart';
+import 'video_card_menu_sheet.dart';
+import 'scroll_aware_hover_region.dart';
+import 'video_card_feedback.dart';
+import 'text_measurement_cache.dart';
+export 'video_card_feedback.dart' show VideoCardFeedback;
+import '../../features/video/domain/video_card_interactions.dart';
+import '../../core/presentation/workspace_activity.dart';
+
+import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart' show listEquals;
+
+import '../../domain/video.dart';
+
+String compactCount(int? count) {
+  if (count == null) return '—';
+  if (count >= 100000000) return '${(count / 100000000).toStringAsFixed(1)}亿';
+  if (count >= 10000) return '${(count / 10000).toStringAsFixed(1)}万';
+  return '$count';
+}
+
+String compactCountLabel(int? count, String text) {
+  final value = text.trim();
+  if (value.isEmpty) {
+    return compactCount(count);
+  }
+  // Keep server-provided abbreviations; format decimal count text locally.
+  final numericCount = int.tryParse(value, radix: 10);
+  return numericCount == null ? text : compactCount(numericCount);
+}
+
+String durationLabel(Duration duration) {
+  final hours = duration.inHours;
+  final minutes = duration.inMinutes.remainder(60).toString().padLeft(2, '0');
+  final seconds = duration.inSeconds.remainder(60).toString().padLeft(2, '0');
+  return hours > 0 ? '$hours:$minutes:$seconds' : '$minutes:$seconds';
+}
+
+enum VideoCardMenuAction {
+  notInterested,
+  watchLater,
+  cancelWatchLater,
+  removeWatchLater,
+  removeHistory,
+}
+
+final class VideoCardMenu {
+  const VideoCardMenu({
+    required this.actions,
+    this.onSelected,
+    this.busy = false,
+  });
+  final List<VideoCardMenuAction> actions;
+  final ValueChanged<VideoCardMenuAction>? onSelected;
+  final bool busy;
+}
+
+enum _VideoCardWidthTier {
+  compact(10, 20, 14),
+  medium(11, 24, 17),
+  regular(12, 28, 20);
+
+  const _VideoCardWidthTier(
+    this.coverFontSize,
+    this.menuButtonSize,
+    this.menuIconSize,
+  );
+
+  final double coverFontSize;
+  final double menuButtonSize;
+  final double menuIconSize;
+
+  static _VideoCardWidthTier fromWidth(double cardWidth) => switch (cardWidth) {
+    < 180 => compact,
+    < 240 => medium,
+    _ => regular,
+  };
+}
+
+final class VideoCard extends StatefulWidget {
+  const VideoCard({
+    super.key,
+    required this.video,
+    required this.onTap,
+    this.progress,
+    this.onOpenUser,
+    this.showUpBadge = false,
+    this.showRecommendationReason = false,
+    this.highlightQuery = '',
+    this.playCountText = '',
+    this.danmakuCountText = '',
+    this.publishText = '',
+    this.publishedAt,
+    this.publishTooltip,
+    this.menu,
+    this.feedback,
+    this.showWatchLaterButton = true,
+  });
+
+  final ValueChanged<UserId>? onOpenUser;
+  final VideoSummary video;
+  final VoidCallback onTap;
+  final double? progress;
+  final bool showUpBadge;
+  final bool showRecommendationReason;
+  final String highlightQuery;
+  // Counts may arrive as decimal text or server-provided abbreviations.
+  final String playCountText;
+  final String danmakuCountText;
+  final String publishText;
+  final DateTime? publishedAt;
+  final String? publishTooltip;
+  final VideoCardMenu? menu;
+  final VideoCardFeedback? feedback;
+  final bool showWatchLaterButton;
+
+  // Home/history mappings may recreate a summary without changing its content.
+  // Compare everything consumed by this card and its preview, not callbacks:
+  // actions forward through State to the current page/query and queue.
+  Object get _content => (
+    video.id,
+    video.title,
+    video.coverUrl,
+    video.author,
+    video.duration,
+    video.playCount,
+    video.danmakuCount,
+    video.publishedAt,
+    video.authorAvatarUrl,
+    video.authorId,
+    video.recommendationReason,
+    video.isFollowed,
+    video.previewCid,
+    video.access.kind,
+    video.access.canWatch,
+    video.access.canPreview,
+    progress,
+    onOpenUser != null,
+    showUpBadge,
+    showRecommendationReason,
+    highlightQuery,
+    playCountText,
+    danmakuCountText,
+    publishText,
+    publishedAt,
+    publishTooltip,
+    showWatchLaterButton,
+    menu != null,
+    menu?.busy,
+    menu?.onSelected != null,
+    feedback != null,
+    feedback?.busy,
+    feedback?.onUndo != null,
+  );
+
+  @override
+  State<VideoCard> createState() => _VideoCardState();
+}
+
+final class _VideoCardState extends State<VideoCard> {
+  static const _titleFontSize = 15.0;
+
+  bool _hovered = false;
+  bool _focused = false;
+  bool _authorHovered = false;
+  bool _menuFocused = false;
+  bool _menuOpen = false;
+  bool _addingWatchLater = false;
+  int _addGeneration = 0;
+  VideoCardInteractions? _interactions;
+  Widget? _card;
+  final _menuAnchor = GlobalKey();
+  StreamSubscription<VideoId>? _watchLaterSubscription;
+
+  VideoCardMenu? get _menu {
+    final menu = widget.menu;
+    final interactions = _interactions;
+    if (interactions is! VideoCardWatchLaterToggle ||
+        !widget.showWatchLaterButton ||
+        !widget.video.id.isValid ||
+        menu?.actions.contains(VideoCardMenuAction.removeWatchLater) == true) {
+      return menu;
+    }
+    final action = interactions.isAdded(widget.video.id)
+        ? VideoCardMenuAction.cancelWatchLater
+        : VideoCardMenuAction.watchLater;
+    return VideoCardMenu(
+      actions: [
+        for (final existing in menu?.actions ?? <VideoCardMenuAction>[])
+          if (existing != VideoCardMenuAction.watchLater &&
+              existing != VideoCardMenuAction.cancelWatchLater)
+            existing,
+        action,
+      ],
+      busy:
+          menu?.busy == true || interactions.isWatchLaterBusy(widget.video.id),
+      onSelected: menu?.onSelected,
+    );
+  }
+
+  bool get _canShowMenu => switch (_menu) {
+    final menu? =>
+      widget.feedback == null &&
+          !menu.busy &&
+          menu.actions.isNotEmpty &&
+          !_addingWatchLater,
+    null => false,
+  };
+
+  void _update(VoidCallback change) => setState(() {
+    _card = null;
+    change();
+  });
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    _card = null;
+    final interactions = VideoCardInteractionScope.maybeOf(context)
+        ?.interactions;
+    if (_interactions != interactions) {
+      unawaited(_watchLaterSubscription?.cancel());
+      _interactions = interactions;
+      _watchLaterSubscription = interactions is VideoCardWatchLaterToggle
+          ? (interactions as VideoCardWatchLaterToggle).watchLaterChanges
+                .listen((id) {
+                  if (mounted && widget.video.id == id) _update(() {});
+                })
+          : null;
+      _addGeneration++;
+      _addingWatchLater = false;
+    }
+  }
+
+  @override
+  void dispose() {
+    unawaited(_watchLaterSubscription?.cancel());
+    super.dispose();
+  }
+
+  @override
+  void didUpdateWidget(VideoCard oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget._content != oldWidget._content ||
+        !listEquals(widget.menu?.actions, oldWidget.menu?.actions)) {
+      _card = null;
+    }
+    if (widget.video.id != oldWidget.video.id) {
+      _addGeneration++;
+      _addingWatchLater = false;
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) => _card ??= LayoutBuilder(
+    builder: (context, constraints) =>
+        _buildCard(context, constraints.maxWidth),
+  );
+
+  Widget _buildCard(BuildContext context, double cardWidth) {
+    final theme = Theme.of(context);
+    final scheme = theme.colorScheme;
+    final video = widget.video;
+    final menu = _menu;
+    final playLabel = compactCountLabel(video.playCount, widget.playCountText);
+    final danmakuLabel = compactCountLabel(
+      video.danmakuCount,
+      widget.danmakuCountText,
+    );
+    final textScaler = MediaQuery.textScalerOf(context);
+    final titleStyle = theme.textTheme.bodyMedium?.copyWith(
+      fontSize: _titleFontSize,
+      fontWeight: FontWeight.w500,
+      height: 1.4,
+    );
+    final highlighted = (_hovered || _focused) && !_authorHovered;
+    final progress = widget.progress;
+    return ScrollAwareHoverRegion(
+      onHover: (hovered) => _update(() => _hovered = hovered),
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 120),
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(
+            color: _focused ? scheme.primary : Colors.transparent,
+          ),
+        ),
+        child: Material(
+          color: Colors.transparent,
+          borderRadius: BorderRadius.circular(7),
+          clipBehavior: Clip.none,
+          child: InkWell(
+            onTap: widget.feedback == null ? () => widget.onTap() : null,
+            onLongPress: widget.feedback == null ? _showMenu : null,
+            hoverColor: Colors.transparent,
+            hoverDuration: Duration.zero,
+            onFocusChange: (value) => _update(() => _focused = value),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                AspectRatio(
+                  aspectRatio: 16 / 9,
+                  child: switch (widget.feedback) {
+                    final feedback? => VideoCardFeedbackCover(
+                      feedback: VideoCardFeedback(
+                        busy: feedback.busy,
+                        onUndo: feedback.onUndo == null
+                            ? null
+                            : () => widget.feedback?.onUndo?.call(),
+                      ),
+                      background: video.coverUrl.isEmpty
+                          ? _coverFallback(context)
+                          : AppCoverImage(
+                              url: video.coverUrl,
+                              fit: BoxFit.cover,
+                              errorBuilder: (_, _, _) =>
+                                  _coverFallback(context),
+                            ),
+                    ),
+                    null => VideoCardCover(
+                      video: video,
+                      showWatchLaterButton: widget.showWatchLaterButton,
+                      focused: _focused,
+                      hovered: _hovered,
+                      // VideoCardCover clips the complete cover and overlays.
+                      child: Stack(
+                        fit: StackFit.expand,
+                        children: [
+                          if (video.coverUrl.isNotEmpty)
+                            AppCoverImage(
+                              url: video.coverUrl,
+                              fit: BoxFit.cover,
+                              excludeFromSemantics: true,
+                              errorBuilder: (_, _, _) =>
+                                  _coverFallback(context),
+                              frameBuilder: (_, child, frame, _) =>
+                                  frame != null
+                                  ? child
+                                  : _coverFallback(context),
+                            )
+                          else
+                            _coverFallback(context),
+                          Align(
+                            alignment: Alignment.bottomCenter,
+                            child: SizedBox(
+                              width: double.infinity,
+                              height: textScaler.scale(36) + 20,
+                              child: const DecoratedBox(
+                                decoration: BoxDecoration(
+                                  gradient: LinearGradient(
+                                    begin: Alignment.topCenter,
+                                    end: Alignment.bottomCenter,
+                                    colors: [
+                                      Colors.transparent,
+                                      Color(0xC4000000),
+                                    ],
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ),
+                          Positioned(
+                            left: 7,
+                            right: 7,
+                            bottom: 7,
+                            child: Semantics(
+                              label:
+                                  '观看 $playLabel，'
+                                  '弹幕 $danmakuLabel，'
+                                  '时长 ${durationLabel(video.duration)}',
+                              excludeSemantics: true,
+                              child: _CoverMetadata(
+                                video: video,
+                                cardWidth: cardWidth,
+                                playLabel: playLabel,
+                                danmakuLabel: danmakuLabel,
+                              ),
+                            ),
+                          ),
+                          if (progress != null)
+                            Align(
+                              alignment: Alignment.bottomLeft,
+                              child: LinearProgressIndicator(
+                                value: progress.clamp(0.0, 1.0),
+                                minHeight: 3,
+                                backgroundColor: Colors.transparent,
+                              ),
+                            ),
+                        ],
+                      ),
+                    ),
+                  },
+                ),
+                Padding(
+                  padding: const EdgeInsets.only(top: 9, bottom: 1),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      // Reserve two scaled lines so author rows align across cards.
+                      SizedBox(
+                        width: double.infinity,
+                        height: textScaler.scale(_titleFontSize) * 1.4 * 2 + 2,
+                        child: Row(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Expanded(
+                              child: HighlightedText(
+                                video.title,
+                                query: widget.highlightQuery,
+                                maxLines: 2,
+                                showOverflowTooltip: true,
+                                // Hover still reveals the full title. Cards
+                                // with actions reserve touch long-press for
+                                // their menu instead of the nested tooltip.
+                                tooltipTriggerMode: menu == null
+                                    ? TooltipTriggerMode.longPress
+                                    : TooltipTriggerMode.manual,
+                                style: titleStyle?.copyWith(
+                                  color: highlighted
+                                      ? scheme.primary
+                                      : scheme.onSurface,
+                                ),
+                              ),
+                            ),
+                            if (widget.feedback == null)
+                              if (menu case final menu?)
+                                _menuButton(menu, cardWidth),
+                          ],
+                        ),
+                      ),
+                      const SizedBox(height: 6),
+                      _AuthorMetadata(
+                        video: video,
+                        onOpenUser: widget.feedback == null
+                            ? widget.onOpenUser == null
+                                  ? null
+                                  : (id) => widget.onOpenUser?.call(id)
+                            : null,
+                        hovered: _authorHovered,
+                        onHover: (value) =>
+                            _update(() => _authorHovered = value),
+                        showUpBadge: widget.showUpBadge,
+                        reason: widget.showRecommendationReason
+                            ? video.recommendationReason
+                            : null,
+                        showFollowed:
+                            widget.showRecommendationReason &&
+                            video.isFollowed == true,
+                        publishText: widget.publishText,
+                        publishedAt: widget.publishedAt,
+                        publishTooltip: widget.publishTooltip,
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _menuButton(VideoCardMenu menu, double cardWidth) {
+    final tier = _VideoCardWidthTier.fromWidth(cardWidth);
+    final buttonSize = Size.square(tier.menuButtonSize);
+    final progressSize = tier.menuIconSize * .8;
+    final touchPlatform = switch (Theme.of(context).platform) {
+      TargetPlatform.android || TargetPlatform.iOS => true,
+      _ => false,
+    };
+    final visible =
+        _hovered || _focused || _menuFocused || _menuOpen || touchPlatform;
+    final busy = menu.busy || _addingWatchLater;
+    return Focus(
+      skipTraversal: true,
+      onFocusChange: (focused) => _update(() => _menuFocused = focused),
+      child: Opacity(
+        opacity: visible ? 1 : 0,
+        child: IgnorePointer(
+          ignoring: !visible,
+          // A disabled nested button must consume taps rather than open video.
+          child: GestureDetector(
+            key: _menuAnchor,
+            onTap: () {},
+            excludeFromSemantics: true,
+            child: IconButton(
+              key: const ValueKey('video-card-title-menu'),
+              onPressed: _canShowMenu ? _showMenu : null,
+              icon: busy
+                  ? SizedBox.square(
+                      dimension: progressSize,
+                      child: const CircularProgressIndicator(
+                        strokeWidth: 2,
+                        semanticsLabel: '操作中',
+                      ),
+                    )
+                  : Icon(
+                      Icons.more_vert,
+                      size: tier.menuIconSize,
+                      semanticLabel: '更多操作',
+                    ),
+              iconSize: tier.menuIconSize,
+              style: IconButton.styleFrom(
+                minimumSize: buttonSize,
+                maximumSize: buttonSize,
+                padding: EdgeInsets.zero,
+                visualDensity: VisualDensity.standard,
+                // Padded tap targets would still reserve 48px beside the title.
+                tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Future<void> _showMenu() async {
+    if (!_canShowMenu || _menuOpen || !WorkspaceActivity.isActive(context)) {
+      return;
+    }
+    final id = widget.video.id;
+    final generation = _addGeneration;
+    final interactions = _interactions;
+    _update(() => _menuOpen = true);
+    VideoCardMenuAction? selected;
+    try {
+      if (interactions is VideoCardWatchLaterToggle &&
+          widget.showWatchLaterButton &&
+          widget.menu?.actions.contains(VideoCardMenuAction.removeWatchLater) !=
+              true) {
+        final loaded = await interactions.refreshWatchLater();
+        if (!mounted ||
+            generation != _addGeneration ||
+            interactions != _interactions ||
+            widget.video.id != id ||
+            !WorkspaceActivity.isActive(context)) {
+          return;
+        }
+        if (!loaded) {
+          VideoCardInteractionScope.maybeOf(context)
+              ?.onNotice(context, '无法读取稍后再看状态，请稍后重试');
+          return;
+        }
+      }
+      final menu = _menu;
+      if (menu == null || !_canShowMenu) return;
+      if (MediaQuery.sizeOf(context).width < 600) {
+        selected = await showVideoCardMenuSheet(context, [
+          for (final action in menu.actions)
+            (value: action, icon: _menuIcon(action), label: _menuLabel(action)),
+        ]);
+      } else {
+        final overlay = Navigator.of(context).overlay;
+        final anchor = _menuAnchor.currentContext?.findRenderObject();
+        if (overlay == null || anchor is! RenderBox) return;
+        final overlayBox = overlay.context.findRenderObject() as RenderBox;
+        RelativeRect position() => RelativeRect.fromRect(
+          Rect.fromPoints(
+            anchor.localToGlobal(
+              Offset(0, anchor.size.height),
+              ancestor: overlayBox,
+            ),
+            anchor.localToGlobal(
+              anchor.size.bottomRight(Offset.zero),
+              ancestor: overlayBox,
+            ),
+          ),
+          Offset.zero & overlayBox.size,
+        );
+        final initialPosition = position();
+        selected = await showMenu<VideoCardMenuAction>(
+          context: context,
+          positionBuilder: (_, _) =>
+              anchor.attached ? position() : initialPosition,
+          constraints: const BoxConstraints(minWidth: 156, maxWidth: 240),
+          color: Theme.of(context).colorScheme.surface,
+          surfaceTintColor: Colors.transparent,
+          elevation: 3,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(8),
+            side: BorderSide(
+              color: Theme.of(context).colorScheme.outlineVariant
+                  .withValues(alpha: .6),
+            ),
+          ),
+          items: [
+            for (final action in menu.actions)
+              PopupMenuItem(
+                value: action,
+                child: Row(
+                  children: [
+                    Icon(_menuIcon(action), size: 19),
+                    const SizedBox(width: 10),
+                    Flexible(child: Text(_menuLabel(action))),
+                  ],
+                ),
+              ),
+          ],
+        );
+      }
+    } finally {
+      if (mounted) _update(() => _menuOpen = false);
+    }
+    // The retained tile may now represent another account, video or action set.
+    if (!mounted ||
+        selected == null ||
+        widget.video.id != id ||
+        generation != _addGeneration ||
+        interactions != _interactions ||
+        !_canShowMenu ||
+        !WorkspaceActivity.isActive(context) ||
+        _menu?.actions.contains(selected) != true) {
+      return;
+    }
+    if (selected == VideoCardMenuAction.watchLater) {
+      await _addWatchLater();
+    } else if (selected == VideoCardMenuAction.cancelWatchLater) {
+      await _addWatchLater(remove: true);
+    } else {
+      widget.menu?.onSelected?.call(selected);
+    }
+  }
+
+  static IconData _menuIcon(VideoCardMenuAction action) => switch (action) {
+    VideoCardMenuAction.notInterested => Icons.not_interested_outlined,
+    VideoCardMenuAction.watchLater => Icons.watch_later_outlined,
+    VideoCardMenuAction.cancelWatchLater => Icons.watch_later_outlined,
+    VideoCardMenuAction.removeWatchLater ||
+    VideoCardMenuAction.removeHistory => Icons.delete_outline,
+  };
+
+  static String _menuLabel(VideoCardMenuAction action) => switch (action) {
+    VideoCardMenuAction.notInterested => '不感兴趣',
+    VideoCardMenuAction.watchLater => '稍后再看',
+    VideoCardMenuAction.cancelWatchLater => '取消稍后再看',
+    VideoCardMenuAction.removeWatchLater => '取消稍后再看',
+    VideoCardMenuAction.removeHistory => '删除记录',
+  };
+
+  Future<void> _addWatchLater({bool remove = false}) async {
+    if (!WorkspaceActivity.isActive(context)) return;
+    final scope = VideoCardInteractionScope.maybeOf(context);
+    if (scope == null || _addingWatchLater) return;
+    final id = widget.video.id;
+    final generation = ++_addGeneration;
+    _update(() => _addingWatchLater = true);
+    final interactions = scope.interactions;
+    final result = remove && interactions is VideoCardWatchLaterToggle
+        ? await (interactions as VideoCardWatchLaterToggle).removeWatchLater(id)
+        : await interactions.addWatchLater(id);
+    if (!mounted ||
+        generation != _addGeneration ||
+        widget.video.id != id ||
+        scope.interactions !=
+            VideoCardInteractionScope.maybeOf(context)?.interactions) {
+      return;
+    }
+    _update(() => _addingWatchLater = false);
+    final message = watchLaterResultMessage(result, removing: remove);
+    if (message != null && WorkspaceActivity.isActive(context)) {
+      scope.onNotice(context, message);
+    }
+  }
+
+  Widget _coverFallback(BuildContext context) => ColoredBox(
+    color: Theme.of(context).colorScheme.surfaceContainerHighest,
+    child: Icon(
+      Icons.image_outlined,
+      size: 36,
+      color: Theme.of(context).colorScheme.onSurfaceVariant
+          .withValues(alpha: 0.6),
+    ),
+  );
+}
+
+final class _CoverMetadata extends StatefulWidget {
+  const _CoverMetadata({
+    required this.video,
+    required this.cardWidth,
+    required this.playLabel,
+    required this.danmakuLabel,
+  });
+
+  final VideoSummary video;
+  final double cardWidth;
+  final String playLabel;
+  final String danmakuLabel;
+
+  @override
+  State<_CoverMetadata> createState() => _CoverMetadataState();
+}
+
+typedef _CoverTextMetricsKey = ({
+  String label,
+  TextStyle style,
+  TextScaler textScaler,
+  TextDirection direction,
+  Locale? locale,
+});
+
+final class _CoverMetadataState extends State<_CoverMetadata> {
+  // Three labels across three width tiers; changing data cannot grow the cache.
+  static const _maximumCachedWidths = 9;
+  final _textWidths = <_CoverTextMetricsKey, double>{};
+  TextMeasurementCache? _measurements;
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    _measurements = TextMeasurementCacheScope.maybeOf(context);
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    PaintingBinding.instance.systemFonts.addListener(_fontsChanged);
+  }
+
+  void _fontsChanged() {
+    setState(_textWidths.clear);
+  }
+
+  @override
+  void dispose() {
+    PaintingBinding.instance.systemFonts.removeListener(_fontsChanged);
+    super.dispose();
+  }
+
+  double _textWidth(_CoverTextMetricsKey key) {
+    final cached = _textWidths.remove(key);
+    if (cached != null) {
+      _textWidths[key] = cached;
+      return cached;
+    }
+    double measure() {
+      final painter = TextPainter(
+        text: TextSpan(text: key.label, style: key.style),
+        textDirection: key.direction,
+        textScaler: key.textScaler,
+        locale: key.locale,
+        maxLines: 1,
+      );
+      try {
+        painter.layout();
+        return painter.width;
+      } finally {
+        painter.dispose();
+      }
+    }
+
+    final width = _measurements?.width(key, measure) ?? measure();
+    if (_textWidths.length == _maximumCachedWidths) {
+      _textWidths.remove(_textWidths.keys.first);
+    }
+    _textWidths[key] = width;
+    return width;
+  }
+
+  static const _regularFontSize = 12.0;
+  static const _style = TextStyle(
+    color: Colors.white,
+    fontSize: _regularFontSize,
+    fontWeight: FontWeight.w400,
+    // The cover gradient supplies contrast. Blurred glyph shadows add raster
+    // work for every label in dense rows even when the cards are unchanged.
+    shadows: [],
+  );
+  static const _iconSize = 13.0;
+  static const _iconGap = 3.0;
+  static const _countGap = 8.0;
+  static const _durationGap = 8.0;
+
+  @override
+  Widget build(BuildContext context) => LayoutBuilder(
+    builder: (context, constraints) {
+      // Use the whole card width so padding does not shift typography tiers.
+      final fontSize = _VideoCardWidthTier.fromWidth(widget.cardWidth)
+          .coverFontSize;
+      final sizeFactor = fontSize / _regularFontSize;
+      final style = _style.copyWith(fontSize: fontSize);
+      final iconSize = _iconSize * sizeFactor;
+      final iconGap = _iconGap * sizeFactor;
+      final countGap = _countGap * sizeFactor;
+      final durationGap = _durationGap * sizeFactor;
+      final timeLabel = durationLabel(widget.video.duration);
+      var effectiveStyle = DefaultTextStyle.of(context).style.merge(style);
+      if (MediaQuery.boldTextOf(context)) {
+        effectiveStyle = effectiveStyle.merge(
+          const TextStyle(fontWeight: FontWeight.bold),
+        );
+      }
+      final textScaler = MediaQuery.textScalerOf(context);
+      final direction = Directionality.of(context);
+      final locale = Localizations.maybeLocaleOf(context);
+      double textWidth(String label) => _textWidth((
+        label: label,
+        style: effectiveStyle,
+        textScaler: textScaler,
+        direction: direction,
+        locale: locale,
+      ));
+
+      // Measure the actual labels, icons and gaps before moving time below counts.
+      final countsWidth =
+          textWidth(widget.playLabel) +
+          textWidth(widget.danmakuLabel) +
+          2 * (iconSize + iconGap) +
+          countGap;
+      final countsFit = countsWidth <= constraints.maxWidth;
+      final stacked =
+          countsWidth + durationGap + textWidth(timeLabel) >
+          constraints.maxWidth;
+      Widget count(IconData icon, String label) => Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(icon, color: Colors.white, size: iconSize),
+          SizedBox(width: iconGap),
+          Flexible(
+            child: Text(
+              label,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: style,
+            ),
+          ),
+        ],
+      );
+
+      final play = count(BiliIcons.playCount, widget.playLabel);
+      final danmaku = count(BiliIcons.danmaku, widget.danmakuLabel);
+      final counts = Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          countsFit ? play : Flexible(child: play),
+          SizedBox(width: countGap),
+          countsFit ? danmaku : Flexible(child: danmaku),
+        ],
+      );
+      final duration = Text(
+        timeLabel,
+        maxLines: 1,
+        overflow: TextOverflow.ellipsis,
+        style: style,
+      );
+      if (stacked) {
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            counts,
+            SizedBox(height: 2 * sizeFactor),
+            Align(alignment: Alignment.centerRight, child: duration),
+          ],
+        );
+      }
+      return Row(
+        children: [
+          Expanded(child: counts),
+          SizedBox(width: durationGap),
+          duration,
+        ],
+      );
+    },
+  );
+}
+
+final class _AuthorMetadata extends StatelessWidget {
+  const _AuthorMetadata({
+    required this.video,
+    required this.onOpenUser,
+    required this.hovered,
+    required this.onHover,
+    required this.showUpBadge,
+    required this.reason,
+    required this.showFollowed,
+    required this.publishText,
+    required this.publishedAt,
+    required this.publishTooltip,
+  });
+  final VideoSummary video;
+  final ValueChanged<UserId>? onOpenUser;
+  final bool hovered;
+  final ValueChanged<bool> onHover;
+  final bool showUpBadge;
+  final String? reason;
+  final bool showFollowed;
+  final String publishText;
+  final DateTime? publishedAt;
+  final String? publishTooltip;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final id = video.authorId;
+    final openUser = onOpenUser;
+    final timeLabel = commentTimeLabel(video.publishedAt ?? publishedAt);
+    final dateText = timeLabel.isEmpty ? publishText : timeLabel;
+    final reasonText = reason?.trim() ?? '';
+    final labels = [
+      if (reasonText.isNotEmpty) reasonText,
+      if (showFollowed && !const {'已关注', '新关注'}.contains(reasonText)) '已关注',
+    ];
+    final author = ScrollAwareHoverRegion(
+      onHover: onHover,
+      child: InkWell(
+        onTap: id != null && id.isValid && openUser != null
+            ? () => openUser(id)
+            : null,
+        hoverColor: Colors.transparent,
+        hoverDuration: Duration.zero,
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            if (showUpBadge) ...[
+              const BiliUpBadge(size: 16),
+              const SizedBox(width: 4),
+            ],
+            Flexible(
+              child: Text(
+                video.author,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: theme.textTheme.bodySmall?.copyWith(
+                  color: hovered ? theme.colorScheme.primary : null,
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+    Widget badge(String text) => Tooltip(
+      message: text,
+      child: DecoratedBox(
+        decoration: BoxDecoration(
+          color: const Color(
+            0xFFFF7F50,
+          ).withValues(alpha: theme.brightness == Brightness.dark ? .18 : .1),
+          borderRadius: BorderRadius.circular(3),
+        ),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
+          child: Text(
+            text,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(fontSize: 11, color: Color(0xFFFF7F50)),
+          ),
+        ),
+      ),
+    );
+    final published = Text(
+      dateText,
+      maxLines: 1,
+      overflow: TextOverflow.ellipsis,
+      style: theme.textTheme.bodySmall,
+    );
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        return Row(
+          children: [
+            if (labels.isNotEmpty) ...[
+              ConstrainedBox(
+                constraints: BoxConstraints(
+                  maxWidth: constraints.maxWidth * .35,
+                ),
+                child: labels.length == 1
+                    ? badge(labels.single)
+                    : Wrap(
+                        spacing: 4,
+                        runSpacing: 4,
+                        children: [for (final label in labels) badge(label)],
+                      ),
+              ),
+              const SizedBox(width: 6),
+            ],
+            Expanded(
+              child: Align(alignment: Alignment.centerLeft, child: author),
+            ),
+            if (dateText.isNotEmpty) ...[
+              const SizedBox(width: 6),
+              ConstrainedBox(
+                constraints: BoxConstraints(
+                  maxWidth: constraints.maxWidth * .4,
+                ),
+                child: publishTooltip == null
+                    ? published
+                    : Tooltip(message: publishTooltip, child: published),
+              ),
+            ],
+          ],
+        );
+      },
+    );
+  }
+}

@@ -1,0 +1,544 @@
+# GitHub Actions CI/CD 与安装包
+
+更新日期：2026-11-07。配置覆盖 Android arm64、Windows x64／ARM64、macOS arm64／Intel x64、iOS arm64、Linux x64；iOS／Linux 的远端构建进展与设备未验项详见[接入记录](ios-linux.md)，Intel macOS 的新增配置与验证边界见下文。本地验证结果与远端、设备未测项分别记录。此流程交付预览构建，不表示各平台验收或 M5 正式发行完成。
+
+## 入口与分工
+
+- [CI](../../.github/workflows/ci.yml)：替换原来的 `windows.yml`；分支 push、PR、手动运行时执行检查及构建，也供 Release 复用。
+- [Release preview](../../.github/workflows/release.yml)：在 Actions 页面手动运行；可选择五个平台，并可按目标复用同提交、同版本且已通过检查与构建的 CI 产物，只补建缺少的目标。全部所选构建通过后，将完整产物汇总上传为单个 Actions ZIP artifact，再创建 **draft + prerelease** 并上传安装包、签名公钥证书、汇总 ZIP、校验文件与第三方说明。不会自动公开发布。
+- [检查脚本](../../tool/check.ps1)：本地默认检查根应用和四个独立包；CI 在 Ubuntu 使用 PowerShell 7，分别执行 `Lint`、两份 `RootTests` 分片和 `PackageTests`。格式检查覆盖根应用与各包，根分析统一扫描子包，故分析前仍安装所有包的开发依赖。`-EnforceLockfile` 要求 pub 使用提交的锁文件及内容哈希。
+- [构建打包脚本](../../tool/build-release.ps1)：各平台使用对应主机生成预览包，缺文件、原生命令失败、签名失败立即停止。已有同目标输出目录时拒绝覆盖，重新本地构建前先将其移走。
+
+| 任务 | Runner | 产物与边界 |
+| --- | --- | --- |
+| 版本解析、静态检查、根测试分片与包测试 | `ubuntu-24.04` | 无需真实账号；独立 mux 任务覆盖封装原生测试，不自动运行在线或原生播放集成测试 |
+| Android | `ubuntu-24.04`，Temurin JDK 17 | 仅 arm64 的 release APK；正常构建复用固定 keystore，PR 使用临时预览签名 |
+| Windows x64 | `windows-2022`，Visual Studio C++ / Windows SDK / .NET 8 / WiX 6.0.2 | 同时提供 x64 MSIX、MSI 和 EXE 安装包；全部包含完整原生 DLL/data 及 VC++ runtime |
+| Windows ARM64 | `windows-11-arm`，Visual Studio ARM64 / Windows SDK / WiX 6.0.2 | ARM64 MSIX、MSI 和 EXE，独立 mux／媒体 SDK／VC++ runtime；打包前检查全部 EXE／DLL 的 PE 架构 |
+| macOS | `macos-15`，Apple Silicon / Xcode 26.2 | arm64 DMG；先验证签名／最终权限、同一 Release 应用首帧和跨进程 Keychain 读写删除，再由 `hdiutil` 打包校验；仅 ad-hoc 签名，未 notarize |
+| macOS Intel | `macos-15-intel`，Intel x64 / Xcode 26.2 | x64 DMG；校验架构、版本、签名、权限和镜像；不运行启动／窗口／Keychain smoke，metadata 明确记录跳过 |
+| iOS | `macos-15`，Apple Silicon / Xcode 26.2 / CocoaPods | arm64 未签名 IPA；核对应用版本、bundle ID、arm64 framework 及 Payload 布局；安装前需自行 Apple 签名 |
+| Linux | `ubuntu-24.04`，GTK / libsecret / libmpv / Flatpak SDK | x64 AppImage 与 Flatpak；携带媒体依赖，核对版本及主机／实际 Flatpak Runtime 内动态依赖；X11／XWayland |
+| Release 上传 | `ubuntu-24.04` | 合并并校验本次所选平台的 Actions artifacts，上传汇总 ZIP artifact 后创建草稿 |
+
+PowerShell 7 是跨平台 shell；Ubuntu 上复用 `.ps1` 不要求 Windows。Windows 原生构建需要 Windows 主机与 Visual Studio 工具链，macOS 原生构建需要对应架构的 macOS/Xcode 主机。现有 `enable_macos` 开关同时控制 arm64 和 x64 两项矩阵；两项分别安装对应架构的 Flutter SDK，产物与缓存按架构隔离。arm64 启用 `--enable-macos-arm64-only`，x64 显式关闭该选项；两者均通过固定 SDK 支持的 `FLUTTER_XCODE_ARCHS` 指定单一架构（`arm64`／`x86_64`），与对应的 mux framework 一致。参见 [Flutter Windows 构建](https://docs.flutter.dev/platform-integration/windows/building)、[GitHub runner 范围](https://docs.github.com/en/actions/reference/runners/github-hosted-runners)。
+
+Flutter 固定 **3.47.6 stable / Dart 3.13.5**；升级需同时调整工作流、检查/构建脚本并重新验证。根及各包保留各自 `pubspec.lock`，pub 缓存键包含锁文件哈希。Actions 使用已查询的提交 SHA，并以注释标明主版本。Android SDK/NDK 由该 SDK 的 Flutter Gradle 配置选择，AGP/Gradle 版本沿用工程；Apple 构建在 Flutter 和 mux 编译前通过 `DEVELOPER_DIR` 显式选择 runner 中的 Xcode 26.2，并打印 Xcode、Swift 和 SDK 版本，缺少该版本立即失败。系统映像仍由对应 runner 提供，不能据此宣称完全可重现的原生工具链。
+
+SDK 缓存沿用 `flutter-action` 的默认键，按系统、SDK 架构、版本和 revision 隔离。Pub 缓存键只配置系统、架构和版本前缀，由当前固定的 Action 追加所有 `pubspec.lock` 的哈希，避免重复追加。Gradle 缓存键覆盖 Android Gradle 脚本、`android/gradle.properties`、Wrapper 配置、所有 Pub 锁文件和 `.flutter-version`，使插件、SDK 或构建配置变化后保存新的依赖缓存。Release 新建构建沿用同一套缓存配置；开启产物复用时直接读取匹配 CI 的 artifacts。
+
+Linux 另用固定 SHA 的 `actions/cache/restore`／`save` 缓存 apt 下载的 `.deb`、经 SHA-256 校验的 linuxdeploy／GTK hook，以及用户级 Flatpak Runtime／SDK。键包含 Ubuntu 24.04 x64、相关安装脚本／manifest 哈希和 UTC 周次，允许恢复同配置前一周的缓存；仍执行 apt 索引更新、包验证和 Flatpak `--or-update`，工具每次读取缓存也校验固定哈希，损坏条目重新下载。依赖安装后、应用构建前单独保存，避免后续打包失败丢失缓存，也不把安装后的 BiliSail Flatpak 混进 Runtime 缓存。不缓存整个 `build/`、`.dart_tool/`、apt 索引或签名材料；首次运行仍需完整下载，缓存实际命中及耗时须由新 CI 确认。
+
+GitHub hosted runner 存在 `/etc/apt/apt-mirrors.txt` 时，Linux 安装入口将该列表中的 Ubuntu 官方 archive／security 提到 Azure 镜像之前，保留其他条目及镜像回退；只在 `GITHUB_ACTIONS=true` 时执行，不修改本机开发环境。APT 连接／无数据超时不能保证终止持续低速传输，故调整镜像优先级与缓存配合使用。索引、apt 包安装、Flatpak Runtime／SDK 和固定打包工具分别打印分组及墙钟耗时，便于从下一次 CI 区分下载、安装和打包耗时。
+
+CI 在工作流顶层显式设置 `PUB_HOSTED_URL=https://pub.dev`，与根应用及 `bili_api`、`bili_player`、`bili_danmaku`、`bili_mux` 五份锁文件的官方 hosted 源一致；检查、三端构建和 Release 复用流程均使用此源。Dependabot 的 Pub 更新也使用官方源。严格检查和提交前，本地应先设置 `$env:PUB_HOSTED_URL = 'https://pub.dev'`（PowerShell）或 `export PUB_HOSTED_URL=https://pub.dev`（sh），再执行 `pwsh ./tool/check.ps1 -EnforceLockfile`。
+
+macOS 原生插件按根 `pubspec.yaml` 的项目级开关统一使用 CocoaPods。2026-10-29 切换 Predidit media-kit Native Assets 后，最低应用部署版本为 macOS 13，旧 `media_kit_libs_*` 已移除；原生下载和校验由核心 hook 负责，视频插件继续走 CocoaPods，见[迁移](../predidit-media-migration.md)。此前关闭 SwiftPM 的历史原因见 [macOS 视频插件修复](piliplus-media-kit-port.md#2026-10-19macos-视频插件误选-swiftpm-stub)。无需修改机器全局开关。
+
+本地临时使用镜像运行 `pub get` 可能改写锁文件中的 hosted URL；不要将这类改动混入提交。恢复官方源后重新验证五份锁文件，并确认依赖版本、约束、内容哈希没有意外变化。`FLUTTER_STORAGE_BASE_URL` 控制 Flutter SDK 下载，与 Pub 包源是不同设置。
+
+Dart 3.13.5 内置的 [Pub 源码](https://github.com/dart-lang/pub/blob/ec276d10a7fa0f6c6ec005340fb9ad29f3b012d0/lib/src/source/hosted.dart#L40) 会将官方旧域名 `https://pub.dartlang.org` 规范化为 `https://pub.dev`，再用于 hosted 来源身份比较；两者的文本差异不等于来源冲突。`pub.flutter-io.cn` 是另一来源，不能依赖这种官方别名规范化消除镜像冲突。验证以固定 Flutter 3.47.6 的实际解析、内容哈希与 `--enforce-lockfile` 为准。
+
+## Windows ARM64 构建
+
+2026-11-07 新增 `windows-arm64`。现有 `enable_windows` 同时选择 x64 和 ARM64；push／PR 默认构建两种架构，复用调用方的 `build_targets` 可单独选择其中一种。目标、产物名、诊断目录、Release 缺失目标重建和 SHA-256 校验均独立。
+
+固定 Flutter 3.47.6 的 `build windows` 根据 Dart 进程 ABI 选择目标，没有可用的 Windows 交叉编译参数，因此 ARM64 使用 `windows-11-arm` runner。Flutter Action 先取得 x64 发行配置，再通过 [ARM64 引导脚本](../../tool/setup-windows-arm64-flutter.ps1) 检查 Dart PE 架构；必要时调用该固定 SDK 自带的 `update_dart_sdk.ps1` 下载对应 engine 的原生 ARM64 Dart 并重建工具 snapshot。拒绝 x64 回退，SDK 缓存按目标隔离。不能将 matrix 的发行 `arch: x64` 当成应用目标架构。入口在非匹配 Windows 主机上立即拒绝构建，避免把 x64 包重命名为 ARM64。
+
+- mux 使用 MSYS2 CLANGARM64 的 Clang／LLVM，从既定 FFmpeg n9.0.2 源码构建，输出到 `native/prebuilt/windows-arm64`。
+- media-kit 的库插件按 `FLUTTER_TARGET_PLATFORM` 选择完整 SDK 和 ANGLE，镜像、归档和逐文件 SHA-256 均由个人 fork 维护，详见[媒体来源](media-kit-personal-fork-2026-11-07.md)。ARM64 mpv 使用 7-Zip 解压 ARM64 BCJ 过滤器，保留标准 OpenGL render API。
+- 可选 fvp 后端使用固定 MDK 0.39.0 的完整 Windows SDK，从中选择 ARM64 slice；x64 继续使用原独立 SDK。
+- 应用 staging 中所有 EXE／DLL 的 PE 架构必须匹配目标；VC++ runtime、原生安装器辅助 DLL、WiX MSI／Burn EXE、MSIX ProcessorArchitecture 均跟随目标。ARM64 MSIX 和 MSI 要求 Windows 11；身份、Publisher 和证书边界保持一致。
+- 打包后再次解包检查安装器辅助文件架构、MSI SummaryInformation 平台及原有 UI／升级目录语义。安装器检查不执行实际安装或卸载。
+
+普通入口：在 Windows 11 ARM64 主机准备 MSYS2 CLANGARM64、Visual Studio ARM64 C++、Windows SDK 和 7-Zip 后执行 `./tool/build-release.ps1 -Target windows-arm64 -Version x.y.z+N`。产物为 `artifacts/windows-arm64/release/BiliSail-<version>-windows-arm64.{msix,msi,exe,cer}` 及来源、元信息和各自 SHA-256。
+
+本轮在独立检出执行根检查：格式、静态分析、182 项构建计划检查、74 项 Release／README 回归及 Windows 安装器／PE／MSIX 专项通过。四个包合计 1,056 项离线测试通过；mux 原生 10 项因未配置 `BILI_MUX_LIBRARY` 跳过。根测试批次 4,582 项通过、13 项跳过，日志轮转与下载用例共 9 项在并发负载下失败；两个相关测试文件串行重跑 36 项全部通过；随后以 `flutter test --no-pub --concurrency=2` 完整重跑根应用，4,591 项通过、13 项环境跳过，未修改断言或产品逻辑。根应用与四个包最终合计 5,647 项离线测试通过。完整重跑日志为 `build/windows-arm64-root-low-concurrency.log`，其余日志为 `build/windows-arm64-{final-lint,isolated-root-tests,isolated-package-tests,rerun-existing-io-tests,packaging-tests}.log`。两份媒体锁文件通过 Pub 严格解析，其他三份锁文件未改。真实 WiX 6.0.2 使用受控 ARM64 占位 payload 完成 MSI／EXE 编译与 67 项解包／SummaryInformation 平台检查（`build/windows-arm64-installer-validation.log`）；它验证打包结构，不代表真实安装 UI 或完整应用启动。
+
+个人媒体 fork 的 [Windows 原生 CI 42366829360](https://github.com/CKopoer/media-kit/actions/runs/42366829360) 已在 Windows x64／ARM64 完成 Flutter Release fixture 编译、插件链接、DLL PE 架构与加载校验、mpv client ABI 和创建／销毁验证；ARM64 job 使用原生 Dart 3.13.5。该 fixture 不是 BiliSail 完整应用，没有执行视频纹理绘制或硬解性能验收。
+
+新增配置不代表设备播放、硬解性能、账号、实际安装或覆盖升级已经通过。Windows ARM64 完整应用包仍需在本次主仓库提交进入远端后由 CI 构建，不能用原生插件 smoke 代替完整应用验收。
+
+## 版本与产物
+
+手动输入版本使用 Flutter 的 `x.y.z+N`，例如 `0.1.0+1`；留空取根 `pubspec.yaml`。脚本通过 `--build-name` 和 `--build-number` 传入，不改源码版本或锁文件。Windows MSIX 与 EXE Bundle 映射为 `x.y.z.N`；MSI 使用三段 `x.y.(z*1000+N)`，例如 `0.3.0+1` → `0.3.1`、`0.3.0+2` → `0.3.2`、`0.3.1+1` → `0.3.1001`。选择 Windows 时要求 `x/y <= 255`、`0 <= N <= 999`、`z*1000+N <= 65535`，版本解析阶段即拒绝超限值。MSI 只比较前三段，不能直接采用 MSIX 的第四段构建号；依据 [Microsoft ProductVersion](https://learn.microsoft.com/en-us/windows/win32/msi/productversion)。Android 保留 arm64 split APK，但在 `android/gradle.properties` 设置 `force-version-code-ignoring-abi=true`，关闭 Flutter 的 ABI 偏移。Gradle 从 `--build-name x.y.z` 与原始 `--build-number N` 计算 `versionCode = x*10000 + y*1000 + z*100 + N`，例如 `0.5.5+2` → `5502`，不再额外加 2000，也不要将已编码值传给 `--build-number`。CI 与打包脚本共用 [Android 版本校验](../../tool/android-version.ps1)，要求 `0 <= x <= 209999`、`0 <= y,z <= 9`、`0 <= N <= 99`，禁止前导零及最终编码为零（`0.0.0+0`）；Gradle 独立校验相同范围，直接 Flutter 构建也不能绕过数值限制。构建号满 99 后提升补丁号并重置构建号；补丁/次版本满 9 后相应提升上一段，避免进位碰撞。最大编码为 2099999999，低于 Android 上限 2100000000。打包后使用 SDK `aapt dump badging` 校验实际 APK 的 applicationId、versionName 和 versionCode；仅校验成功才将编码写入 metadata 并生成校验文件。MSIX 升级要求递增包版本并保持 identity/publisher。已有同名 tag 时拒绝附加新构建，重跑草稿遇到冲突时也需使用新版本或显式处理旧草稿。
+
+每个平台的 `artifacts/<target>/release/` 中包含：
+
+- Android 的 `.apk`、Windows 的 `.msix` / `.msi` / `.exe`、macOS 的 `.dmg`、Linux 的 `.AppImage` / `.flatpak`，命名均为 `BiliSail-<version>-<target>.<extension>`；iOS 使用 `BiliSail-<version>-ios-arm64-unsigned.ipa`。
+- Windows 包旁的 `.cer`，只含签名证书公钥。
+- `.build-info.json`：源码 revision 与 `sourceDirty`、Flutter/engine/Dart 版本、目标、签名类型、Android 签名证书 SHA-256、Windows MSI 内部版本与 WiX 版本、runner image、根锁文件 SHA-256；macOS 的 `macosValidation` 保存校验结果，x64 的 `startup`／`credentials` 为 `skipped`，并记录 `runtimeSmokeSkipReason=disabled-for-build-target`。
+- `.mux-source.zip`：mux 组件源码归档及重建说明。
+- 每个上述文件对应的 `.sha256`，格式兼容 `sha256sum -c`。
+
+Release 草稿附安装包、Windows 公钥证书及它们的 `.sha256`，另附 `THIRD_PARTY_NOTICES.md`。2026-11-07 起，同时附上 `BiliSail-<version>-release-bundle.zip` 及其 `.sha256`，便于一次下载全部所选平台产物。`.build-info.json`、`.mux-source.zip` 和这两类文件的 `.sha256` 参与上传前校验，保存在各平台 Actions artifacts 和汇总 ZIP 内，不单独上传为 Release 附件；草稿说明继续链接本次 Actions 记录，可从构建来源汇总定位对应产物。
+
+2026-11-01 起，Release 在完整性、来源、版本和 SHA-256 校验通过后，使用与 CI 相同的固定版本 [`actions/upload-artifact`](https://github.com/actions/upload-artifact#upload-using-multiple-paths-and-exclusions)，将本次所选平台的新建及复用产物汇总为 `BiliSail-<version>-release-bundle`，保留 14 天。可在本次 Release 运行的 Artifacts 区域一次下载同名 `.zip`；其中 `release-assets/` 包含安装包、Windows 公钥证书、构建信息、mux 源码归档及各自校验文件，根目录另含 `THIRD_PARTY_NOTICES.md`。由 artifact 上传直接生成 ZIP，压缩级别沿用 CI 的 `0`，避免重复压缩已有安装包。汇总上传在草稿创建前完成，上传失败则停止创建草稿；之后草稿或清理步骤失败时，已上传的汇总包仍保留。重跑本次运行的草稿任务时覆盖同名汇总包，草稿任务超时从 10 分钟增至 20 分钟，为额外上传留出时间。
+
+2026-11-07 的草稿上传沿用此汇总包：通过上传步骤返回的 `artifact-id` 调用 [GitHub artifact 下载接口](https://docs.github.com/en/rest/actions/artifacts#download-an-artifact)，直接保存原始 ZIP，并与上传步骤的 `artifact-digest` 核对 SHA-256 后生成同名校验文件。下载或摘要校验失败会阻止草稿创建。下载使用既有 `actions: read` 权限与 `github.token`，不增加 Secret，也不重新压缩或改变 ZIP 内容。
+
+2026-11-07 本地验证：64 项 Release 定向回归通过，直接执行生产 PowerShell 草稿步骤并模拟下载与 `gh`，覆盖全部／单个平台附件、原始 ZIP 字节和校验文件保留，以及下载／摘要失败阻止草稿创建。Release／CI 工作流通过 actionlint 1.7.12，本文 45 条本地链接和 `git diff --check` 通过。`tool/check.ps1 -SkipPub` 的打包边界、格式、静态分析及 5569 项 Dart／Flutter 测试通过（根应用 4545、API 677、播放器 181、弹幕 161、封装 5）；13 项 Windows symlink 用例因权限不足、10 项 mux 原生用例因未配置 `BILI_MUX_LIBRARY` 跳过，不计作原生覆盖。日志为 `build/release-bundle-draft-check.log`，五份锁文件无修改。本轮未触发远端 Release，实际 artifact 下载及草稿附件上传仍待新流程运行确认。
+
+2026-11-01 本地验证：Release／CI 工作流通过 actionlint 1.7.12，60 项 Release 定向回归、本文件 43 条本地链接和 `git diff --check` 通过。`tool/check.ps1 -SkipPub` 的打包边界、格式、静态分析、根应用 3912 项及四包 817 项离线测试通过；13 项 Windows symlink 用例因权限跳过，10 项 mux 原生用例因未配置 `BILI_MUX_LIBRARY` 跳过，不计作原生覆盖。日志保存在 `build/release-bundle-check.log`；本轮未手动运行远端 Release，汇总 artifact 的实际上传和下载仍待新流程运行确认。
+
+2026-10-31 附件筛选验证：`node --test tool/test-release-ci-reuse.cjs` 的 54 项测试通过，新增回归直接执行工作流的 PowerShell 草稿步骤并模拟 `gh`，核对六个目标的完整附件集合及原始 Actions 文件保留。Release／CI 工作流通过 actionlint，本文件 38 条本地链接和 `git diff --check` 通过。`tool/check.ps1 -SkipPub` 的打包边界、格式、静态分析及 4645 项离线测试通过；13 项 Windows symlink 用例因权限跳过，10 项 mux 原生用例因未配置 `BILI_MUX_LIBRARY` 跳过，不计作原生覆盖。日志保存在 `build/release-asset-selection-check.log`；本轮未运行远端 Release 或创建实际草稿。
+
+### README 下载链接自动更新
+
+[下载链接工作流](../../.github/workflows/readme-downloads.yml) 在 Release 公开发布、转为正式版、编辑或删除后，以及手动运行时，读取 GitHub `releases/latest` 对应正式版及其附件，按现有 `BiliSail-<version>-<target>.<extension>` 命名匹配安装包。iOS 保留 `-unsigned.ipa`，Windows 同时识别 EXE／MSI／MSIX 和 CER，macOS 分别识别 arm64／x64。Release 文件名和附件不变，也不额外复制安装包。
+
+工作流只更新默认分支 README 中 `release-downloads:start/end` 标记之间的下载版本及表格下载列，保留安装说明和其他内容；无变化时不创建提交。链接直接采用 API 返回的 `browser_download_url`，没有对应附件时标为“暂未提供”，不回退到旧版或生成不存在的下载链接。草稿与预发布不会替换正式版目标。`GITHUB_TOKEN` 创建的 README 提交不再次触发普通 push CI，公开发布由维护者操作；首次使用前需把此工作流和标记提交到默认分支。默认分支若禁止工作流直接写入，任务会失败并保留原 README，不绕过分支规则。
+
+GitHub 官方的 [`/releases/latest/download/<附件名>`](https://docs.github.com/en/repositories/releasing-projects-on-github/linking-to-releases) 需要准确的附件名，不解析版本通配符。本仓库保留带版本号的附件，由工作流自动维护 README 中的实际直链，维护者无需每次修改版本号；下载 URL 本身仍包含发布版本。
+
+2026-10-29 本地验证：`node --test tool/test-readme-downloads.cjs` 的 10 项测试通过，覆盖十种附件、部分平台、旧版本／未完成上传排除、换行和安装说明保留、重复运行、并发编辑冲突及写入权限失败；actionlint 1.7.12 检查新工作流及 Release 工作流通过。使用 GitHub API 实际 `v1.2.3+1` 响应核对 README 的 9 个下载链接，并确认重复生成无差异。本轮 `tool/check.ps1 -SkipPub` 的格式、静态分析、根应用 3352 项及四包 709 项测试通过；13 项 Windows symlink 因权限跳过，10 项 mux 原生用例因未配置 `BILI_MUX_LIBRARY` 跳过，不计作原生集成覆盖。远端自动更新尚未触发，未修改任何 Release 附件。
+
+CI 的 artifacts 保留 14 天；Release 默认从本次运行下载，开启复用时按目标从匹配的已完成 CI 运行下载，并合并本次补建产物。所选平台失败时不创建新草稿。不使用参考仓库的 WebDAV、NuGet ZIP、UWP manifest、Chocolatey 或 TLS 验证绕过逻辑。
+
+### Release 复用已完成 CI（2026-10-31）
+
+Release 通过 `workflow_call` 调用同一份 `ci.yml`，检查、根应用分片测试、包测试、原生 mux 回归和所选平台打包共用实现。手动输入 `reuse_ci_build` 默认关闭；开启后，Release 先用与 CI 共用的[构建计划脚本](../../tool/ci-build-plan.ps1)解析版本、校验平台版本限制并生成目标列表，再通过 GitHub Actions API 分页查找每个目标可复用的构建。
+
+每个所选目标分别满足以下条件即可复用，允许不同目标来自不同的 CI 运行：
+
+- 来源是本仓库 `ci.yml` 的 `push` 或手动运行，且运行已完成。排除 PR、fork 来源和运行中的运行。
+- 来源运行的 `Analyze and test` 汇总任务及该目标的 `Build <target>` 任务均完成且成功；通过分页读取最新任务状态确认，不只检查是否有 artifact。其他平台失败或取消，不影响已通过检查与构建的目标；检查失败、缺失或该目标任务未成功时不得复用。
+- 源码 SHA 与此次 Release 所选 ref 对应提交完全一致，解析后的 `x.y.z+N` 版本完全一致，支持手动版本覆盖。仅版本相同而提交不同不能复用。
+- 对应 artifact 未过期且非空。macOS 选项包含 arm64 和 Intel x64 两个独立目标，可以复用一个、只补建另一个；草稿最终仍须同时包含两者。未选中的平台不下载、不构建。
+
+为在下载大型安装包前匹配版本，CI 的内部 artifact 名称为 `BiliSail-<target>-<version>-packages`；公开安装包和 Release 附件文件名不变。历史无版本 artifact 不参与复用，过期或未命中的目标加入待构建列表。全部命中时跳过整套 CI，直接下载、校验并创建草稿；部分命中时仅构建缺少的目标，共享检查和测试仍执行一次；完全未命中或关闭选项时执行原有完整流程。例如选中 Android、Windows 和 Linux，前两者已有可用构建时，只编译 Linux，然后合并三个平台的产物创建草稿。
+
+CI 仅在 `workflow_call` 开放内部 `build_targets` JSON 数组输入，将构建矩阵限制为启用平台的非空子集，不改变普通 push、PR 和手动 CI 的平台选择方式。Release 仍先验证全部所选平台的版本限制，待补建列表不能加入未选中、重复或非法目标。
+
+草稿任务从本次运行下载补建产物，再按各目标的来源 run ID 和准确 artifact 名称，通过 `gh run download` 合并复用产物；复用来源无需按平台重复上传，但会随全部所选产物进入本次运行的汇总包。API 权限、网络或下载错误均使任务失败，不将故障当作未命中，也不丢弃缺失平台；使用任务级 `actions: read` 和现有 `GITHUB_TOKEN`，无需新 Secret。每个目标的复用／构建决定及来源运行链接写入 Actions summary。
+
+无论复用还是新构建，创建草稿前都会经[产物校验脚本](../../tool/release-ci-reuse.cjs)核对完整文件集合：所选平台安装包、Windows 公钥证书、build-info、mux 源码归档及各自 SHA-256。build-info 必须匹配源码 SHA、版本、目标、Flutter 版本、根锁文件哈希且 `sourceDirty=false`；锁文件允许同一内容的 LF／CRLF checkout 哈希差异。Android 必须使用配置的固定 keystore，临时 PR 签名不得发布。下载后任何内容不符立即停止，不创建草稿，也不静默改用其他产物。既有 tag 冲突检查、草稿／预发布属性和最新 15 个 Release 保留规则继续沿用。
+
+本地定向验证：`node --test tool/test-release-ci-reuse.cjs` 的 53 项测试通过，覆盖多运行合并、64 种复用／补建组合、共享检查与目标任务状态、准确来源下载及失败传播、过期／缺失／临时签名／篡改拒绝、Windows 换行及草稿任务条件的 128 种状态组合；`tool/test-ci-build-plan.ps1` 的 117 项检查通过，覆盖全部 32 种平台开关组合、63 种非空目标子集及共享版本／输入边界。两个工作流通过 actionlint 1.7.12，修改的 PowerShell／JavaScript 通过语法检查，本文件 38 条本地链接及 `git diff --check` 通过。
+
+本轮 `tool/check.ps1 -SkipPub` 的打包边界、格式、静态分析、根应用 3752 项及四包 754 项离线测试通过；13 项 Windows symlink 用例因权限跳过，10 项 mux 原生用例因未配置 `BILI_MUX_LIBRARY` 跳过，不计作原生集成覆盖。按平台复用版本的日志保存在 `build/release-ci-partial-reuse-check.log`。本轮未做安装包构建和设备测试；远端 CI 产物复用和 Release 草稿创建尚未执行，需在本次工作流生效并有对应检查与目标构建通过的 CI 后验证。
+
+Release 草稿及全部附件上传成功后，使用 GitHub 官方 [actions/github-script v8](https://github.com/actions/github-script/tree/ed597411d8f924073f98dfc5c65a23a2325f34cd) 清理旧版本，固定提交 `ed597411d8f924073f98dfc5c65a23a2325f34cd`。分页获取正式发布、预发布和草稿，合计保留按 `created_at` 排序的最新 **15 个 Release**；时间相同时按 Release ID 从新到旧排序。超出部分删除 Release 及其附件，保留 Git 标签与 Actions 运行记录。草稿没有 `published_at`，不能直接使用按发布时间排序或排除草稿的清理包。使用该 job 已有的 `contents: write` 和默认 `github.token`，不需额外 Secret；发布流程继续由 `release-preview` 并发组串行执行。删除请求失败立即停止，清理后再次分页查询并验证总数不超过 15，查询失败或仍超限会使流程失败。本地配置检查不代表已经执行远端删除。
+
+构建前先 `pub get --enforce-lockfile`，随后保留 Flutter build 默认的 pub 阶段，并检查构建后锁文件哈希不变。在 Flutter 3.47.6 中，`--no-pub` 还会跳过 release 原生插件注册文件的重生成：本轮 Android 初次构建因此错误引用 dev-only `integration_test`。修正采用 SDK 自身的重生成流程，不手改 `GeneratedPluginRegistrant.java`。
+
+仅指定 `--target-platform android-arm64` 时，该 SDK 仍会把插件的其他 ABI 库装入非 split APK。本轮检查发现 armeabi-v7a/x86_64 的 mpv/JNI 库，已增加 `--split-per-abi` 并在脚本中校验 APK 内只存在 `arm64-v8a`。
+
+## Release #82：复用产物的分页返回结构（2026-10-31）
+
+[失败任务](https://github.com/CKopoer/BiliSail/actions/runs/41215540020/job/124579168305) 对应提交 `266d33fb7132e00bcd7299df5bdb78c1a1785769`、版本 `1.2.6+0`，开启了 `reuse_ci_build`。版本与平台解析成功，随后 `planReleaseBuilds` 在读取第一页时抛出 `TypeError: page.data.workflow_runs is not iterable`，构建和草稿任务均被跳过。同提交的 [CI #254](https://github.com/CKopoer/BiliSail/actions/runs/41213220364) 已通过共享检查和六个目标构建，查询时六份版本化产物均非空且未过期。
+
+根因是混用了原始 REST 响应与 Octokit 分页器的返回结构。REST 返回 `{ total_count, workflow_runs }`，但 [`paginate.iterator`](https://github.com/octokit/plugin-paginate-rest.js#octokitpaginateiterator) 已将集合解包为 `page.data` 数组；原脚本又读取 `.workflow_runs`，得到 `undefined`。修复直接遍历 `page.data`，同步纠正测试替身的结构，并覆盖空页、跨页查找、全部命中后停止，以及首个／后续分页错误继续阻断发布。原有同提交、同版本、检查与目标任务成功、来源和 SHA-256 校验门槛保持不变。
+
+定向回归 59 项通过；改正替身后、修复生产代码前，可复现与线上相同的异常。另下载工作流固定的 `actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3` 完整运行时，以请求 hook 提供原始 REST 响应，让实际 Octokit 完成解包和翻页：旧脚本复现异常，修复后全部命中、跨页命中、部分命中、空集合、首个请求失败和部分命中后翻页失败六种场景均通过。其中来源运行、任务和产物字段采用上述 CI 查询快照；这是实际客户端配合受控响应的验证，没有下载安装包或创建远端草稿。日志位于 `build/validation/release-reuse-runtime-{original,fixed}.log`。
+
+本机 Windows / Flutter 3.47.6 的 `tool/check.ps1 -SkipPub` 完整通过打包边界、格式、静态分析及 4651 项 Dart／Flutter 测试（根应用 3860、API 536、播放器 105、弹幕 145、封装 5）。13 项 Windows 符号链接用例因权限不足、10 项 mux 原生用例因未配置 `BILI_MUX_LIBRARY` 跳过，不能计作原生覆盖。JavaScript 语法、两份工作流的 actionlint 1.7.12、本文 38 条本地链接及 `git diff --check` 通过，五份锁文件无修改。完整检查日志为 `build/release-reuse-fix-check.log`；没有执行新安装包构建、设备测试或修复后的远端 Release。
+
+重跑旧 Release run 仍使用旧提交，不会取得本次脚本修复。修复进入新提交后，应先取得该提交的同版本 CI 产物，再新建启用复用的 Release；提交不同的旧产物仍不会复用。
+
+## Release 产物混入 Windows 安装器中间文件（2026-11-01）
+
+[失败任务](https://github.com/CKopoer/BiliSail/actions/runs/41220937672/job/124595231809) 对应提交 `463358953dec5832ed29a831593ab0a1dd88dabd`、版本 `1.2.6+0`。六个目标都成功复用同提交的 [CI 41218198314](https://github.com/CKopoer/BiliSail/actions/runs/41218198314)；下载成功后，`verifyReleaseAssets` 因文件集合不符而停止，未执行草稿创建。
+
+根因在 [MSI 打包辅助函数](../../tool/windows-installers.ps1)：`New-WindowsMsi` 按安装包的目标目录创建 `installer-native` 和 `installer-artwork`，把 CMake 输出、WiX SDK、辅助 DLL 与界面图片留在 `release/`。CI 上传 `release/*` 时会递归包含这些目录；[Windows 来源 job](https://github.com/CKopoer/BiliSail/actions/runs/41218198314/job/124588925880) 记录实际上传了 124 个文件，超出 Windows 约定的 12 个文件（四种分发文件、metadata、mux 源码及各自校验）。此前测试直接构造干净的产物目录，未覆盖安装器生成中间文件的行为。
+
+修复由 [正式打包入口](../../tool/build-release.ps1) 把已有 `installer-work` 传入 `New-WindowsMsi`，原生辅助文件和图片统一放到工作目录，并与 EXE 打包复用；最终安装包仍输出到 `release/`，随安装包分发的 UI 源码、许可及 SDK 头文件仍保留在 payload。严格文件集合、SHA-256 和来源校验继续执行；[校验脚本](../../tool/release-ci-reuse.cjs) 额外列出 `Missing` 与 `Unexpected`，目录名附 `/`，便于后续定位。
+
+[安装器回归](../../tool/test-windows-installers.ps1) 使用生产 MSI／EXE 编排函数和受控编译／WiX 替身，实际创建辅助文件、SDK 头文件及图片，确认它们留在工作目录、`release/` 只有最终包且 payload 保留所需源码。用旧 MSI 实现运行新增回归会失败，修复后通过；[Release 回归](../../tool/test-release-ci-reuse.cjs) 的 60 项测试通过，包含多余目录、缺失校验文件的诊断及原有来源／篡改拒绝场景。这些是脚本与文件系统验证，不能替代真实 WiX 编译、签名、安装或设备验收。
+
+另下载来源 CI 的真实 Windows artifact（ID `13049273310`），确认 ZIP 的 SHA-256 与 GitHub 记录一致。归档共 124 个文件；解压后校验结果为 `Missing: []`、`Unexpected: ["installer-artwork/","installer-native/"]`。在独立本地副本中仅复制原归档的 12 个顶层文件，SHA-256 与版本、源码、Flutter、锁文件来源校验全部通过，原始归档保持完整。日志为 `build/validation/release-real-artifact-verification.log`；这是故障定位验证，不会将整理后的旧包上传或当作修复提交的新产物。
+
+本机 Windows / Flutter 3.47.6 的 `tool/check.ps1 -SkipPub` 完整通过打包边界、格式、静态分析及 4651 项 Dart／Flutter 测试（根应用 3860、API 536、播放器 105、弹幕 145、封装 5）。13 项 Windows 符号链接用例因权限不足、10 项 mux 原生用例因未配置 `BILI_MUX_LIBRARY` 跳过，不计作原生覆盖。修改的 PowerShell／JavaScript 语法、两份工作流的 actionlint 1.7.12、本文 43 条本地链接及 `git diff --check` 通过。检查日志为 `build/release-directory-fix-check.log`，五份锁文件无修改。本轮未执行新的平台安装包构建、签名、设备操作或远端 Release。
+
+旧 CI artifact 中的多余文件不会因推送修复而消失。后续先等待修复提交的 CI 构建成功，再以该提交新建 Release；重跑旧 run 仍使用旧脚本及旧产物。本轮不修改既有 artifact 或 Release。
+
+### 推送后 CI 的截止时间测试时序依赖（2026-11-01）
+
+提交 `9afd4e830011ca1de18541f2544481fc8c3226b8` 的 [CI Package tests](https://github.com/CKopoer/BiliSail/actions/runs/41222589420/job/124600097842) 在 `bili_api/test/read_retry_timeout_test.dart` 失败：`remaining total deadline caps an attempt and prevents another read` 预期 1 次请求，实际 3 次；API 其余 535 项通过。该运行的格式／分析、两份根测试分片和原生 mux 回归均通过，平台构建因检查汇总失败而跳过。
+
+原用例直接用 `DateTime.now()` 设置 250 ms 总截止时间，同时等待 VM 计时器产生请求超时，断言隐含了计时器触发时墙钟一定已越过 deadline。两者并非同一计时来源；墙钟仍早于 deadline 时，生产管线会按剩余正预算进行后续尝试，而不保证恰好只有一次。CI 日志未记录各次墙钟读数，不能还原当时的具体偏差。
+
+用例改为通过已有 `BiliApiClient.clock` 注入固定起点，在该受限请求超时取消时明确推进到截止点，随后验证不再请求、底层取消及精确的 250 ms 单次预算。生产重试策略保持原实现，断言没有放宽。受控将用例内的计时器改为立即回调时，旧用例稳定复现同样的 1／3 次断言差异，修改后通过；对应诊断脚本与日志为 `build/validation/deadline-clock-{original,fixed}_test.dart`、`build/validation/deadline-clock-{original,fixed}.log`。正常计时器下，超时／重试专项 8 项与 `dart analyze` 均通过。
+
+本机 Windows / Flutter 3.47.6 的 `tool/check.ps1 -SkipPub` 全部通过，覆盖打包边界、格式、静态分析及 4651 项 Dart／Flutter 测试（根应用 3860、API 536、播放器 105、弹幕 145、封装 5）。13 项 Windows 符号链接用例因权限不足、10 项 mux 原生用例因未配置 `BILI_MUX_LIBRARY` 跳过，不计作原生覆盖。本文 43 条本地链接与 `git diff --check` 通过，五份锁文件无修改。日志为 `build/api-deadline-clock-fix-check.log`。本次修改仅涉及测试与验证记录，未执行新安装包构建或设备操作；没有运行中的调试应用可执行热重载。
+
+### Intel macOS 打包前 GUI 验收超时（2026-11-02）
+
+[CI 41323620524](https://github.com/CKopoer/BiliSail/actions/runs/41323620524/job/124901479137) 只有 Intel macOS job 失败：Release 编译及签名已完成，两轮播放窗 Space 检查通过后，启动探测超时；其他五个平台与所有检查通过。线程采样定位到 AppKit 应用激活／WindowServer 与虚拟 GPU 等待。共享窗口激活现在仅在应用未激活时请求 `NSApp.activate`，并补充窗口再激活和回收阶段记录；完整证据、修复范围及本机验证边界见[启动专项](macos-release-startup.md#2026-11-02intel-重复应用激活与图形等待)。原有发布验收与超时门槛继续保留，新的 Intel 原生运行结果仍待对应 CI 复验。
+
+后续 [CI 41436650047](https://github.com/CKopoer/BiliSail/actions/runs/41436650047/job/125252164120) 仍在第二轮窗口回收时耗尽 60 秒总预算；上一次成功运行的同类回收单次就耗时约 30.8 秒。本轮将共享校验入口的组合 GUI `startup` 预算独立设为 180 秒，凭据执行仍为 60 秒，原生启动仍为 180 秒；保留完整断言和独立硬超时，不自动重试。两份工作流的构建步骤／job 上限继续为 30／40 分钟。证据、父进程与 worker 预算传递及远端验证边界见[组合 GUI 执行预算](macos-release-startup.md#2026-11-02组合-gui-检查的执行预算)。
+
+### CI #293：字体选择测试点击屏幕外控件（2026-11-05）
+
+[CI #293](https://github.com/CKopoer/BiliSail/actions/runs/41876045873) 对应提交 `55601c393ea093ebe65c2759ac607f51df6206ec`。唯一失败的 [Root app tests (shard 0)](https://github.com/CKopoer/BiliSail/actions/runs/41876045873/job/126735823585) 中，`font_selection_test.dart` 的 `appearance saves bundled and installed fonts independently` 点击未命中，预期保存 `HarmonyOS Sans`，实际仍为 `null`；该分片通过 2159 项、失败 1 项、跳过 2 项。格式／分析、另一根测试分片、包测试及原生 mux 回归均通过，检查汇总随之失败，平台构建被跳过。
+
+外观设置新增“动态页默认标签”后，界面字体选项被推到测试固定的 650 × 850 窗口下方；原测试直接点击文字中心 `(155.7, 855.0)`，未先滚动。Windows 本机原用例复现了相同坐标及断言失败，确认这不是字体保存逻辑的错误。修复在三处入口选择内置字体前调用 `ensureVisible`，等待滚动结束并断言目标可命中，再执行真实点击；继续验证字体保存及界面／弹幕偏好相互独立，不扩大测试窗口或放宽保存断言。
+
+字体专项 6 项通过，修复前后日志分别为 `build/ci-font-selection-before.log`、`build/ci-font-selection-after.log`。Windows / Flutter 3.47.6 的 `tool/check.ps1 -SkipPub` 完整通过打包边界、格式、静态分析及 5077 项 Dart／Flutter 测试（根应用 4177、API 586、播放器 148、弹幕 161、封装 5），日志为 `build/ci-font-selection-check.log`；13 项 Windows 符号链接用例因权限不足、10 项 mux 原生用例因未配置 `BILI_MUX_LIBRARY` 跳过，不计作原生覆盖。本文 45 条本地链接及 `git diff --check` 通过，五份锁文件未变。未修改应用或原生实现，本轮未执行安装包构建和设备操作；未发现运行中的调试应用，无法热重载，测试代码由新测试进程验证。推送后的新 CI 结果另行确认，重跑旧 run 仍会使用旧测试。
+
+## Android 固定签名与覆盖升级
+
+2026-10-07 起，push、手动 CI 和 Release 共用固定 release keystore。仓库 Actions Secrets 配置：
+
+| 名称 | 内容 |
+| --- | --- |
+| `ANDROID_KEYSTORE_BASE64` | 长期保存的 keystore 文件的 Base64 |
+| `ANDROID_KEYSTORE_PASSWORD` | keystore 密码 |
+| `ANDROID_KEY_ALIAS` | 签名私钥别名 |
+| `ANDROID_KEY_PASSWORD` | 签名私钥密码 |
+
+Actions Variable `ANDROID_SIGNING_CERTIFICATE_SHA256` 保存该证书的 64 位十六进制 SHA-256。工作流仅在 Android 的非 PR 打包步骤注入私钥 Secrets；Release 显式将同一组 Secrets 传给复用 CI。缺失、配置不完整、文件无效、密码错误或证书指纹不符均失败，不自动生成密钥或降级为 debug 签名。
+
+[Android 签名辅助脚本](../../tool/android-signing.ps1) 将 keystore 还原到独立临时目录，Linux 目录权限为 `700`；密码仅经进程环境传给 Gradle，不生成含密码的 `key.properties`。打包成功后使用 Android SDK 的 `apksigner verify --verbose --print-certs-pem` 验证 APK，从标准 PEM 证书的 DER 内容计算 SHA-256，要求唯一签名证书且指纹与仓库变量一致；metadata 标记 `signing=configured-keystore` 并保存实际 `androidSigningCertificateSha256`。成功或失败均清理临时 keystore。
+
+PR 不接收长期签名 Secrets，仅通过 `-AndroidPreviewSigning` 显式启用临时 debug 签名，metadata 为 `temporary-debug-key`。这些预览包不属于长期升级链。该模式若收到 release 密钥则拒绝执行。普通 debug 开发不需要 release 凭据；直接 `flutter build apk --release` 需要设置 `ANDROID_KEYSTORE_PATH`、密码和别名环境变量，缺失时拒绝构建。
+
+本机打包可用 `ANDROID_KEYSTORE_PATH` 替代 Base64，但二者只能选一个，并设置同一组密码、别名、证书 SHA-256 以及 `ANDROID_HOME` 或 `ANDROID_SDK_ROOT`。私钥及密码不进入源码、产物、日志或普通配置文件；离线备份须保留 keystore 与受保护的密码。
+
+包名保持 `dev.bilisail.bilisail`。后续发布必须保持同一密钥并递增编码后的 Android versionCode；当前使用上文的紧凑编码且禁用 ABI 偏移，不再使用旧版 `N+2000`。旧临时 debug 签名包不能直接覆盖为不同密钥的新包，原私钥未保存时首次切换需卸载重装，卸载会影响应用私有数据。参考 [Android 签名与升级](https://developer.android.com/studio/publish/app-signing#considerations)、[Android 版本号](https://developer.android.com/studio/publish/versioning#appversioning)、[apksigner](https://developer.android.com/tools/apksigner)。
+
+[签名边界检查](../../tool/test-android-signing.ps1) 已加入 `tool/check.ps1`，覆盖缺失配置、错误 Base64、预览密钥隔离、临时文件清理、调用方 keystore 保留和错误 APK 证书拒绝。实机安装与覆盖升级仍需单独验收。
+
+2026-10-07 本机验证：已配置上述四个 Secrets 与证书指纹变量，生成 RSA 3072 位固定签名密钥，证书有效期至 2056-09-29；keystore 和 DPAPI 加密的密码备份保存在仓库外，仅当前 Windows 用户与 SYSTEM 可访问。证书 SHA-256 为 `be3770071a0e9c71a701405a685dd455cd1baa134abd2eac2d97b9926349996e`。
+
+- `tool/check.ps1 -EnforceLockfile` 的格式、分析、1333 个应用／包测试和 20 个签名边界检查通过，四份锁文件未变。
+- actionlint 1.7.12、PowerShell 解析、144 条相对文档链接及差异检查通过。
+- Gradle 在缺少密钥时拒绝 `preReleaseBuild`，无 release 凭据时 `preDebugBuild` 通过。
+- 在独立检出中生成 `0.3.0+1` 的 arm64 release APK；实际 application ID 为 `dev.bilisail.bilisail`、versionCode 为 `2001`、最低 API 为 `24`。APK 签名、固定证书指纹、单 arm64 ABI、metadata 与 SHA-256 校验通过，包内无 keystore／密码文件，临时签名目录已清理。
+- 本地首次构建受其他开发操作生成的 dev-only 插件注册文件干扰；独立检出的 SQLite 原生资产下载另遇 TLS 连接中断，随后复用经包内固定 SHA-256 验证的缓存完成构建，未改 TLS 验证或生成源码。真实 Android 设备安装、旧临时签名切换与固定签名下的覆盖升级尚未实测。
+
+后续验证修正：远端 [CI 37578713971](https://github.com/CKopoer/BiliSail/actions/runs/37578713971/job/112654748403) 已生成 APK，但原先按人类可读摘要行解析证书的检查失败，未上传 Android 产物。改为读取标准 PEM 证书并自行计算指纹，新增格式变化、重复摘要行和非法证书覆盖；21 项签名边界检查与本机实际 APK 证书校验通过。修复后的远端 CI 结果尚待确认。
+
+## Android 本地开发测试别名（2026-10-26）
+
+连接设备的后续开发测试统一使用 `dev.bilisail.bilisail.test`，桌面名称为 **BiliSail 测试版**，可与正式包 `dev.bilisail.bilisail` 共存。账号、数据库和缓存由 Android 包身份隔离；不自动迁移正式包或历史 `.primaryswitch` 临时包的数据。执行约定同时写入 [AGENTS.md](../../AGENTS.md#android-本地开发测试包)。
+
+```powershell
+./tool/build-android-development.ps1 -Mode Release -Install -DeviceId <adb-device-id>
+```
+
+[开发构建入口](../../tool/build-android-development.ps1) 默认准备 Android arm64 mux，使用普通 `lib/main.dart`，开启 `bilisailDevelopmentBuild=true`，生成真正的 Release/AOT APK。Debug/Profile 也复用相同包名、显示名称和本机 debug keystore；开发 Release 仅供本地测试，不接收正式签名密钥。保留 `%USERPROFILE%/.android/debug.keystore`，脚本记录证书指纹，避免更换签名后丢失覆盖升级能力。
+
+该开关默认关闭，CI 和 Release 工作流继续调用原有 `tool/build-release.ps1`，不传开发别名参数；正式产物的 manifest 校验只接受 `dev.bilisail.bilisail`，拒绝 `.test` 包名。预览签名仍只改变签名，不开启开发别名。
+
+提交前补充实测：不传开发别名参数，使用 CI 的 PR 预览签名模式构建 arm64 Release，实际包名为 `dev.bilisail.bilisail`、名称为 `BiliSail`、versionCode 为 `12104`，签名校验通过且不可调试。关闭预览签名后，缺少正式密钥的 Release 仍在 `preReleaseBuild` 按原规则失败。CI/Release 工作流与正式打包脚本未修改；本次没有触发远端 CI，也没有将该正式身份验证包安装到设备。日志为 `build/validation/ci-identity-default-build.log` 和 `ci-identity-signing-guard.log`。
+
+输出固定为 `build/development/android-arm64/BiliSail-test-arm64-release.apk`，附带 SHA-256 和 JSON 元信息。打包使用 arm64 split，并检查实际包名、名称、版本、签名、ABI 和 AOT 内容；Release 不可调试。只用 `adb install -r` 安装，失败即停止，不自动卸载、清数据或强制降级。构建保留 Flutter 的默认 pub 阶段，以重新生成匹配模式的插件注册文件；不能使用 `--no-pub` 留下 dev-only 注册。
+
+[底栏性能基准](../../tool/test-android-primary-switch.ps1) 同样使用此身份。脚本先保留普通入口的开发 Release，再安装 Profile fixture；`flutter drive --keep-app-running` 防止驱动默认卸载应用，并在 `finally` 中覆盖恢复普通 Release 入口。临时 USB 常亮设置也在结束后还原。[身份检查](../../tool/test-android-development.ps1) 覆盖错误包名、名称、可调试 Release 等拒绝行为，并纳入根检查。
+
+本机本轮验证：Xiaomi 13（2211133C）安装并启动 `1.2.1+4` / versionCode `12104` 的开发 Release，包内只有 `arm64-v8a`，包含 `libapp.so`，无 debug kernel 和 `DEBUGGABLE` 标记。设备同时保留正式包和历史临时包。统一别名下的 Profile 基准完成 24 次切换，驱动保留应用，随后成功覆盖恢复普通 Release；测试版 UID、首次安装时间及私有数据目录 inode 均保持不变，USB 常亮恢复原值。结果见 `build/validation/primary-switch-development-alias.json`，流程日志见 `build/android-development-lifecycle-test.log`。根检查格式、分析与 3510 个离线测试通过；13 个 Windows symlink 用例因权限跳过，10 个 mux 原生用例因未设置 `BILI_MUX_LIBRARY` 跳过，不能算原生覆盖。最终身份检查 7 项与 PowerShell 语法检查通过。这里验证构建、共存、覆盖恢复和启动；不代替真实账号、原生播放及长期性能验收。
+
+## macOS DMG 安装
+
+### BiliMux framework 版本化布局修复（2026-11-07）
+
+[CI 42354013460 的 macOS arm64 job](https://github.com/CKopoer/BiliSail/actions/runs/42354013460/job/128350423542) 构建提交 `b410d075c7f95ba22d19483dc2cb205ea7f68467` 时，已成功选择 Xcode 26.2／Swift 6.2.3，但在 Runner 的 framework 校验阶段失败：`BiliMux.framework` 的根目录包含 `Info.plist`，Xcode 要求非扁平 macOS bundle 的 plist 位于 `Versions/Current/Resources/Info.plist`。原[打包脚本](../../packages/bili_mux/tool/package-apple-framework.sh)对 macOS 仅增加 `Resources/` 存放许可与来源，二进制和 plist 仍在根目录；原目录测试也错误地要求所有平台都不存在 `Versions/`，因此未发现布局问题。
+
+macOS 两种架构的 CocoaPods framework 现在采用 [Apple 版本化结构](https://developer.apple.com/library/archive/documentation/MacOSX/Conceptual/BPFrameworks/Concepts/FrameworkAnatomy.html)：二进制位于 `Versions/A/BiliMux`，plist 和许可／来源／构建配置位于 `Versions/A/Resources/`，`Versions/Current` 链接到 `A`，根目录 `BiliMux`／`Resources` 链接到当前版本；不生成根目录 plist。原有 FFI 加载入口仍可通过二进制链接访问。iOS 保持扁平 bundle。打包时继续完整替换本包输出，清除旧目录和签名，兼容重复构建及 macOS 架构切换；不修改 Pub 缓存或播放器原生依赖。
+
+[目录回归](../../packages/bili_mux/tool/test-apple-framework.sh)先在旧脚本上复现失败，再在修复后通过，覆盖 iOS arm64、macOS arm64／x64、旧目录清理、两次重复打包、三个相对符号链接、plist 位置及二进制／许可／来源内容。WSL 的 Bash 语法检查和两项 Apple media-kit 准备脚本回归通过，日志分别为 `build/ci-macos-framework-before.log`、`build/ci-macos-framework-after.log` 和 `build/ci-macos-framework-apple-check.log`。
+
+Windows／Flutter 3.47.6 的 `tool/check.ps1 -SkipPub` 通过打包边界、格式、静态分析及 5628 项 Dart／Flutter 测试（根应用 4572、API 678、播放器 212、弹幕 161、封装 5），日志为 `build/ci-macos-framework-check.log`。13 项 Windows 符号链接测试因权限不足、10 项 mux 原生测试因未配置 `BILI_MUX_LIBRARY` 跳过，不计作原生覆盖。两份工作流通过 actionlint 1.7.12，两份变更文档的 55 条本地链接及 `git diff --check` 通过，五份锁文件未变化。本机为 Windows，未执行 Xcode 构建、签名、DMG 打包或设备验收；修复提交的远端 macOS 构建结果仍待确认，重跑原 run 会继续使用旧提交。
+
+### 打包与历史验证
+
+macOS 分别生成 `BiliSail-<version>-macos-arm64.dmg` 和 `BiliSail-<version>-macos-x64.dmg`，按 Apple Silicon／Intel 芯片选择。脚本用 `lipo -verify_arch` 核对主程序、App、FlutterMacOS 与 BiliMux framework 的目标架构，再使用 `ditto` 复制完整 `BiliSail.app`，调用 [macOS 发布验证](../../tool/macos-release-validation.ps1) 校验签名、最终权限和可执行文件。arm64 继续启动待打包的 Release 应用验证首帧、窗口交互和跨进程 Keychain 读写／删除；2026-11-02 起按用户要求，x64 不运行这些 smoke，明确记录跳过。通过所选门槛后在镜像根目录加入指向 `/Applications` 的符号链接与 `THIRD_PARTY_NOTICES.md`，使用 `hdiutil create -srcfolder ... -fs HFS+ -format UDZO` 创建压缩只读镜像并执行 `hdiutil verify`；任一保留步骤失败均停止，不上传产物。CI 与 Release 共用此脚本，现有上传通配符同时覆盖两种架构的 DMG、metadata、mux 源码和 SHA-256 文件。
+
+2026-10-29 增加 Intel macOS 构建：下载封装组件新增 `macos-x64` 目标，FFmpeg 与 C++ 包装均以 `x86_64`、最低 macOS 12 编译，并沿用独立目标目录、来源归档和 framework 打包流程。最终 [CI #221](https://github.com/CKopoer/BiliSail/actions/runs/40804720827)（代码提交 `64acaa709315b9c91e15c67ae173f56b05689570`）的 Intel／arm64 hosted 构建、签名校验、待打包应用首帧、跨进程合成 Keychain 读写／删除和 DMG 校验均通过。该次运行全部检查及六个平台构建通过，产物均已上传；实际 DMG 安装升级、Gatekeeper、真实账号、音视频播放与设备操作仍待验收。兼容修复与本地检查见 [Native Assets 迁移记录](../predidit-media-migration.md#ci-构建兼容修复2026-10-29)。
+
+本地定向验证：两份工作流通过 actionlint 1.7.12，修改的 PowerShell／Bash 脚本通过语法检查。执行生产矩阵生成片段，32 种平台开关组合均符合预期；使用 fake 原生命令执行两个 macOS 打包分支，覆盖架构参数、四份二进制架构门槛、metadata、启动验证和 DMG 校验，架构失败会阻止后续打包。mux 的 macOS arm64／x64 与 iOS arm64 编译参数通过 fake Xcode 路径检查；现有 Apple framework 回归扩展覆盖 Intel 及架构切换后的重复打包，实际文件目录检查通过。两种 macOS 发布目标均在 Windows 主机上提前拒绝构建。
+
+本轮 `tool/check.ps1 -SkipPub` 的打包边界、格式与静态分析通过；根测试 3344 项通过、4 项失败、13 项跳过，在同期导航／侧栏修改的工作区中失败：`playback_window_side_button_test.dart:58` 期望左边距 0、实际 76；`shell_layout_test.dart:1009` 的 Android／Windows 消息布局期望高度 43、实际 44；`workspace_shell_test.dart:978` 的系统返回用例期望位置 63、实际 65。因此不计为全量检查通过，后续包测试阶段未执行，也未执行 mux 原生封装回归。保留这些同期源码和测试修改，没有为本任务调整它们。
+
+两个 entitlements 文件移除 `keychain-access-groups`，保留原 Sandbox／网络权限和 Debug/Profile 调试权限；`SystemCredentialStore` 仅对 macOS 配置 `usesDataProtectionKeychain: false`，继续使用系统安全存储。锁定的插件 11.2.0 已支持，不升级依赖。启动探测使用内存数据库和独立凭据前缀；完整验证步骤、失败清理及旧登录／升级授权验收见 [macOS 发布启动与安全存储](macos-release-startup.md)。
+
+打开 DMG 后，将 `BiliSail.app` 拖到镜像中的 `Applications` 入口，复制完成后推出镜像，再从应用程序目录启动。此方式采用 Apple 的应用 bundle 拖拽安装方案，参见 [Apple 应用分发说明](https://developer.apple.com/library/archive/documentation/Porting/Conceptual/PortingUnix/distributing/distibuting.html)。DMG 不改变应用签名：当前仍为 ad-hoc 预览包，未完成 Developer ID 签名与公证；打包与镜像校验不等于启动或 Gatekeeper 验收。
+
+## Windows MSI 与 EXE
+
+2026-10-07 起，CI 与 Release 共用 [Windows 安装器辅助脚本](../../tool/windows-installers.ps1)，在 Windows runner 通过 NuGet 安装固定 **WiX 6.0.2** CLI 与同版本 `WixToolset.BootstrapperApplications.wixext`、`WixToolset.UI.wixext`、`WixToolset.Util.wixext`。需要 .NET 8 runtime 与 .NET SDK，仅作为构建依赖；用户机器无需安装 .NET。工具位于 `artifacts/windows-x64/installer-work/tools/`，不上传到 Release。
+
+[MSI 定义](../../windows/packaging/Installer.wxs) 默认安装到 `%ProgramFiles%\BiliSail`，2026-10-29 起使用[品牌化中文界面](../../windows/packaging/README.md)，首次打开直接选择安装位置，再进入确认、进度与完成页面；目录页可编辑路径或点击 **浏览…**。维护、取消和失败页面同步改版，第三方许可继续随应用文件分发。提供开始菜单入口与系统卸载、修复，并用固定 UpgradeCode 替换旧版本、拒绝较低版本。包内 CAB 嵌入完整 Flutter Release 目录、播放器／WebView／SQLite 原生文件、资产、字体、第三方说明和三份 VC++ runtime DLL；在 MSIX 添加 manifest、PRI 与专属图标之前打包，避免混入 MSIX 文件。系统下限通过注册表实际构建号检查 Windows 10 1809（17763）或更高版本，不依赖 MSI 的兼容性版本属性。
+
+[EXE 定义](../../windows/packaging/Bundle.wxs) 使用原生 Burn 与[自定义中文主题](../../windows/packaging/BundleTheme.xml)，主界面直接显示目标目录；点击 **更改位置 → 浏览** 选择目录，保存后返回主界面点击 **开始安装**。界面的 `InstallFolder` 变量显式传给内嵌 MSI 的 `INSTALLFOLDER`，避免界面选择与实际落盘路径分离。EXE 内嵌已签名的同一 MSI 和 CAB，安装时无需下载应用文件。MSI 与 EXE 属于同一应用安装链，任选一种；安装需要管理员权限，EXE 不再额外显示底层 MSI 的卸载条目。MSIX 具有独立包身份，不自动迁移为 MSI/EXE；账户、设置及卸载后的数据保留行为仍需分别实测。
+
+安装成功时，将实际目录写到 64 位 `HKLM\Software\BiliSail\Installer\InstallFolder`；MSI 和 EXE 后续升级均读取同一位置作为默认值。MSI 显式选择或命令行 `INSTALLFOLDER` 优先于旧位置，目录属性标为 secure 以通过权限提升边界；开始菜单快捷方式仍指向该目录。首次升级来自旧版固定目录安装器时，该注册表值可能不存在，此时继续默认 Program Files。修复属于原安装目录的维护操作，迁移到其他目录建议卸载后重新安装。静默部署可使用 `msiexec /i "BiliSail-<version>-windows-x64.msi" INSTALLFOLDER="D:\Apps\BiliSail" /qn`，不会显示目录选择页。
+
+Windows 打包在签名之后运行 [实际产物检查](../../tool/test-windows-installer-packages.ps1)，反编译 MSI 并提取 EXE 的 BA 与 Burn manifest，验证目录页、浏览事件、双向向导跳转、中文资源、维护／进度／退出路径、位图不遮挡交互控件、改编源码／许可分发、路径持久化、x64 注册表读取及 EXE → MSI 参数传递；失败时 CI 不上传安装包。此检查只读取安装包，不在 CI 主机安装应用。配置依据 [WiX 对话库](https://docs.firegiant.com/wix/tools/wixext/wixui/)、[Burn 标准界面属性](https://docs.firegiant.com/wix/schema/bal/wixstandardbootstrapperapplication/) 与 [Windows Installer 对话事件顺序](https://learn.microsoft.com/en-us/windows/win32/msi/controlevent-table)。
+
+三种安装包共用既有 `MSIX_CERTIFICATE_BASE64` / `MSIX_CERTIFICATE_PASSWORD`，证书 Subject 必须匹配固定的商店 Publisher；无 Secrets 时共用该 Subject 的临时测试证书。先签 MSIX 和 MSI，再构建 EXE，按 WiX 的 detach → 签 engine → reattach → 签 Bundle 顺序完成 EXE 签名；公钥仍通过包旁 `.cer` 导出，私钥只在既有临时签名作用域存在。每个安装包均附独立 SHA-256；任一步失败均不进入上传步骤。自签名证书不代表受系统默认信任的 Authenticode 发行身份。参见 [WiX Bundle 签名](https://docs.firegiant.com/wix/tools/signing/)。
+
+WiX 源码采用 MS-RL，固定版本来源和内嵌 Burn 的许可见 [第三方说明](../../THIRD_PARTY_NOTICES.md)。WiX v6 的二进制发布同时适用 [Open Source Maintenance Fee 条款](https://docs.firegiant.com/wix/osmf/)；本工程不引入 FireGiant 商业扩展。`tool/check.ps1` 增加 [Windows 版本检查](../../tool/test-windows-installers.ps1)，在 Ubuntu 和 Windows 均验证补丁／构建号顺序与超限拒绝。
+
+2026-10-29 后续复查将两种安装器的旧文件夹浏览窗口替换为共享 `IFileOpenDialog`，提供系统地址栏、导航与新建文件夹；辅助库仅用于安装 UI，构建时从固定、校验 SHA-256 的 WiX 6.0.2 SDK 获取接口头文件。系统应用条目沿用 MSI／Burn 原生卸载注册，EXE 隐藏底层 MSI 的重复条目并使用缓存程序卸载。新增隔离安装／修复／卸载回归，真实设置列表检查、用户范围测试与尚未执行的管理员范围验证分别见[选择器与卸载记录](windows-installer-ui.md#2026-10-29文件夹选择器与系统卸载入口复查)。
+
+## Windows MSIX 签名与安装
+
+[AppxManifest.xml](../../windows/packaging/AppxManifest.xml) 的 identity 为 `JerryHsu.BiliSail`，默认 publisher 为 `CN=D34F8E82-088B-4DC8-9296-620B8683A539`，PublisherDisplayName 为 `Jerry Hsu`；Windows 安装下限为 Windows 10 1809（build 17763）。`MakeAppx` 打包完整 Flutter Release 目录，`SignTool` 使用 SHA-256 签名。MSIX 图标在构建时从已有品牌 PNG 派生；生成普通、深色 `unplated`、浅色 `lightunplated` 的多尺寸图标，并使用同一 Windows SDK 的 `MakePri` 与 [PRI 配置](../../windows/packaging/priconfig.xml) 生成 `resources.pri`，供任务栏和开始菜单选择无底板图标。不引入新品牌资源或 Dart 依赖。
+
+无签名 Secrets 时生成一年有效的临时自签证书，产物标记 `self-signed-preview`。安装前需要在测试机器上把对应 `.cer` 信任到 **本地计算机 → 受信任人**，再打开 `.msix`；这一步需要管理员权限。工作流只导出公钥，不上传 PFX、私钥或密码，打包结束后清理本次临时证书/私钥。每次运行的测试证书不同，不能视为长期可升级的正式发行链路。
+
+使用固定签名证书时，在仓库 Actions Secrets 配置：
+
+| 名称 | 内容 |
+| --- | --- |
+| `MSIX_CERTIFICATE_BASE64` | 带私钥的代码签名 PFX 的 Base64 |
+| `MSIX_CERTIFICATE_PASSWORD` | 该 PFX 的密码；无密码 PFX 可留空 |
+
+商店身份固定为源 manifest 中的 Name、Publisher 和 PublisherDisplayName，并在打包前后与确认的 Partner Center 身份比对。旧 Actions Variable `MSIX_PUBLISHER` 不再注入或覆盖包身份，可以移除。已配置 PFX 的 Subject 必须为 `CN=D34F8E82-088B-4DC8-9296-620B8683A539`；旧 `CN=BiliSail` 证书需要更新，否则签名阶段明确失败。PR 构建始终使用临时测试证书，避免向 PR 提供正式私钥。已配置 PFX 无效、密码错误、证书过期或 publisher 不匹配时失败，不降级成测试签名。当前未接入可信时间戳；正式发行还需完善时间戳、证书续期与升级验证。参见 [Microsoft MSIX 证书](https://learn.microsoft.com/en-us/windows/msix/package/create-certificate-package-signing)、[SignTool 签名](https://learn.microsoft.com/en-us/windows/msix/package/sign-app-package-using-signtool)。
+
+macOS ad-hoc 签名不能替代 Developer ID / notarization。资源许可范围沿用 [第三方说明](../../THIRD_PARTY_NOTICES.md)，公开发布前仍需完成其待核实项。
+
+## 验证记录
+
+### 播放页快捷键测试超时修复（2026-10-07）
+
+[CI #23](https://github.com/CKopoer/BiliSail/actions/runs/37637676303/job/112848184331) 使用提交 `0b2605efe9fdb6fc5a30e7e8a920c47ba2540958`，依赖强校验、格式与静态分析通过；根应用测试 1292 项通过、1 项失败，后续包检查与三端构建未执行。失败位于 [播放面板测试](../../test/features/playback/playback_panel_test.dart) 的 `workspace player keys work on entry and after returning to video`，首次进入播放页的 `pumpAndSettle` 超时。
+
+该测试的播放会话默认以真实 `Stopwatch` 驱动弹幕插值，[弹幕控制器](../../packages/bili_danmaku/lib/src/danmaku_controller.dart) 在最近播放状态更新后的 700 毫秒内保持动画，[绘制层](../../packages/bili_danmaku/lib/src/danmaku_overlay.dart) 持续请求下一帧。`pumpAndSettle` 推进 Flutter 测试的模拟时间，两者不共用时钟；快速执行的 runner 可在真实插值窗口结束前耗尽模拟的十分钟超时。本机旧测试单独通过，注入固定单调时钟、让插值保持活跃后，稳定复现同一行的超时。
+
+修复只修改此测试：进入、离开和返回播放页时复用有限帧等待；使用固定单调时钟防止用例依赖机器速度，并断言播放已开始、插值仍活跃、隐藏／返回后的面板可见性。保留倍速、音量、seek、弹幕、全屏、非视频页快捷键屏蔽及单 surface 检查。没有修改播放器运行逻辑或放宽 CI 检查。
+
+本机 Windows / Flutter 3.47.6 下，受控时钟的旧等待方式失败，修复后的同一用例通过；`tool/check.ps1 -EnforceLockfile` 完整通过根应用与三个包的格式、静态分析及 1696 项测试（根应用 1293、API 319、播放器 32、弹幕 52），另通过 21 项 Android 签名边界与 14 项 Windows 安装版本检查。四份锁文件无差异，本文件 18 条本地链接及 `git diff --check` 通过。修复尚未推送或远端重跑；本轮未执行安装包构建或平台实机验证。
+
+### Windows 安装目录选择（2026-10-07）
+
+- 使用本机 WiX 6.0.2 及固定 UI／Util／Bootstrapper 扩展，以已有完整 Release payload 重新打包 `0.3.0+2` 的 MSI 和 EXE，编译通过；再用同一临时测试证书完成 MSI 签名和 EXE 的 engine／Bundle 两阶段签名，签名后的包仍通过 21 项检查。临时私钥已清理，未添加系统信任。本轮只验证安装配置，未重新编译 Flutter，也未替换此前签名发行产物。验证包及日志在 `artifacts/windows-install-directory-validation/`。
+- 新增实际产物检查通过 **21 项**，包括 MSI 目录页和浏览器、欢迎／返回跳转、确认安装、提权属性、升级目录读取与保存、快捷方式，以及 EXE Options／Browse／路径变量到 MSI 的传递。此前无目录向导的安装包被该检查正确拒绝。
+- 使用 Windows Installer `MsiOpenPackageEx(..., MSIOPENPACKAGEFLAGS_IGNOREMACHINESTATE)` 的受限会话，执行包内目录恢复动作和原生 costing：默认 Program Files、显式中文／空格路径、沿用旧目录、显式路径优先于旧目录 **4 项通过**。该句柄禁止改变系统安装状态；测试没有安装、卸载应用或写入 HKLM。依据 [Microsoft 受限安装会话](https://learn.microsoft.com/en-us/windows/win32/api/msi/nf-msi-msiopenpackageexa)。
+- `tool/check.ps1 -SkipPub` 通过根应用 **1286**、API **319**、播放器 **32**、弹幕 **52** 项测试，四组格式／分析通过，原有 Android 签名与 Windows 版本边界检查通过。
+- PowerShell 三份修改脚本的语法解析、两个工作流的 actionlint、109 条修改文档的本地链接与差异检查通过。
+- 尚未运行远端 GitHub CI，也未点击真实向导完成提权安装、实体盘落盘、卸载和跨版本升级；这些不由编译、受限目录解析或包结构检查推导为已验收。既有安装包不会自动变更，下次 CI／Release 打包采用新流程。
+
+### Windows 增加 MSI 与 EXE（2026-10-07）
+
+本机 Windows x64 / Flutter 3.47.6 / WiX 6.0.2 实际运行 `tool/build-release.ps1 -Target windows-x64 -Version '0.3.0+1'`，生成三个安装包、公钥证书、metadata 与五份 SHA-256 校验文件，位于 `artifacts/windows-x64/release/`。metadata 的源码 HEAD 为 `42ea8fd2e44c1e8a6e04104505f317c7040630b6`，包含工作区未提交修改，标记 `sourceDirty=true`，不能仅凭该 HEAD 复现本地包；此前 Windows 输出已另行保留。
+
+- Windows Release 编译、WiX MSI 的内嵌 CAB、MakePri / MakeAppx、MSI / MSIX 签名与 EXE 的 engine / Bundle 两阶段签名全部通过。三个包和签名前的 engine 使用同一导出证书，本轮为 `self-signed-preview`；临时私钥证书已清理，没有添加系统信任。
+- 解包 MSI 后，将全部 **67 个运行文件**逐一与 staging 比较 SHA-256，完整一致，包含资产、字体、原生依赖、VC++ runtime 与 WiX 许可，没有 MSIX 专属文件。读取 MSI 实际执行表确认 `InstallInitialize=1500`、`RemoveExistingProducts=1501`、`InstallFinalize=6600`，升级替换处于可回滚事务内。
+- 解包 EXE，内嵌的已签名 MSI 与独立 `.msi` 的 SHA-256 完全一致。MSIX 运行文件与许可、公钥证书一致性、metadata 中 `windowsMsiVersion=0.3.1` / `windowsInstallerToolVersion=6.0.2`、五份校验文件均通过；产物无 PFX / `.wixpdb` 或旧名称 EXE。
+- `tool/check.ps1 -EnforceLockfile` 已完成依赖强校验；首次测试遇到工作区并行修改的中间状态，更新后运行 `tool/check.ps1 -SkipPub` 全部通过：根应用 **1116**、API **291**、播放器 **22**、弹幕 **52** 项测试，以及 **14** 项新增 Windows 版本边界检查。根应用与三个包的格式、分析均通过，四份锁文件无差异。
+- 两个工作流通过 actionlint 1.7.12；PowerShell 解析、WiX XML 编译、185 条本地文档链接与差异空白检查通过。
+
+尚未推送或运行新版远端 Actions，没有执行 MSI / EXE 的系统安装、卸载、修复、覆盖升级或跨格式迁移，也未用仓库固定 PFX 复验本次新产物。上述验证证明本地构建、签名流程及包内容，不代表系统默认信任、实际安装或原生播放验收。
+
+### 首次 CI/CD 本地验证（2026-10-06）
+
+在本机 Windows 使用 Flutter 3.47.6 / Dart 3.13.5 完成；源码 HEAD 为 `4bcbfb0fe03315543b3dcc18730fed051af0cdbb`，含用户原有修改与本轮配置，metadata 的 `sourceDirty=true`，不能仅凭 HEAD 复现这份本地包。
+
+| 检查 | 结果 |
+| --- | --- |
+| `tool/check.ps1 -EnforceLockfile` | 根应用与三个包的依赖、格式、分析和全部离线测试通过；锁文件无差异 |
+| actionlint 1.7.12 / PowerShell parser | 两个工作流与两个脚本通过；actionlint 下载包按维护方 SHA-256 验证 |
+| CI plan | 全平台、单平台选择通过；全关闭、错误版本格式、MSIX 数字溢出拒绝 |
+| Markdown | 变更文档的 222 条本地链接有效；`git diff --check` 通过 |
+| Windows release → MSIX | 最终构建、MakeAppx 验证/打包、SignTool 测试签名通过；包含完整原生运行目录与三个 VC++ runtime DLL，去除本地构建遗留的旧名称 EXE |
+| MSIX 内容与签名 | manifest identity/version、58 个包条目、播放器库、CMS 数学签名、公钥证书匹配及 SHA-256 通过；无 PFX/私钥，临时签名证书清理通过。未向系统信任区安装证书，不代表已通过受信任发行证书链验证 |
+| Android arm64 release | 最终 split APK 构建、包内 ABI 断言和 metadata 输出通过；初次 `--no-pub` 失败及非 split APK 包含额外 ABI 的修正见上文 |
+
+本地产物位于 `artifacts/windows-x64/release/` 和 `artifacts/android-arm64/release/`，由 Git 忽略；前序尝试另行保留，工作流只上传最终 `release/` 文件。没有执行在线账号操作，没有修改相邻参考仓库或新增 Dart 依赖。
+
+### 首次远端运行的包源修复
+
+[CI #1](https://github.com/CKopoer/BiliSail/actions/runs/37405976185) 使用提交 `415b054698f3a0357b90c4498ef4d4c8d70a2e3c`，版本与平台解析通过；Ubuntu 的 `Analyze and test` 在根应用 `flutter pub get --enforce-lockfile` 阶段以退出码 65 失败，分析、测试及三端构建尚未执行。
+
+根锁文件的 119 个 hosted 依赖均来自 `pub.flutter-io.cn`，三个包锁文件也使用此镜像；本机设置了 `PUB_HOSTED_URL`，初版 CI 未设置，因而使用默认 `pub.dev`。包源身份变化使 pub 重新解析依赖，日志出现 `Would change 119 dependencies` 和 `Unable to satisfy pubspec.yaml using pubspec.lock`。修复在 CI 工作流顶层显式设置相同包源，覆盖检查与构建任务；沿用已验证的锁定版本和内容哈希。
+
+本轮修复在 Windows / Flutter 3.47.6 下运行 `tool/check.ps1 -EnforceLockfile`：根应用 597、`bili_api` 206、`bili_player` 16、`bili_danmaku` 19 项测试全部通过，各目录格式及静态分析通过，四份锁文件 SHA-256 均未变化。两个工作流通过 actionlint 1.7.12；本文件 6 条本地链接及 `git diff --check` 通过。此结果不代表修复后的远端运行或三端构建已通过。
+
+### 干净检出时的子包依赖初始化修复
+
+[CI #2](https://github.com/CKopoer/BiliSail/actions/runs/37407053988/job/112086879462) 使用提交 `8b120ebccee92dccfbf27bc0c4371c92113cfd37`，镜像配置已生效，根依赖安装和格式检查通过；根 `flutter analyze` 在 `packages/bili_api/test` 中找不到 `package:test/test.dart`，产生 1304 条连带诊断，测试及构建尚未执行。
+
+根应用的 `pub get` 不会安装 path 依赖包的 `dev_dependencies`，参见 [Dart 开发依赖说明](https://dart.dev/tools/pub/dependencies#dev-dependencies)。原脚本在根分析后才逐个安装子包依赖；本机已有的子包 `.dart_tool/package_config.json` 掩盖了此问题。修复将根及三个包的依赖安装全部放到任何分析和测试之前，再分别执行完整检查；四次安装均保留锁文件强校验，`-SkipPub` 仍只跳过安装阶段。
+
+在 Windows / Flutter 3.47.6 下，从提交 `8b120eb` 导出两份不含生成配置的源码副本：旧顺序复现相同的 1304 条诊断；替换修复脚本后，先安装全部依赖的根分析通过。隔离副本中 `tool/check.ps1 -EnforceLockfile` 最终通过全部格式、分析及 838 项测试，四份锁文件 SHA-256 均未变化；PowerShell parser、6 条本地文档链接和 `git diff --check` 通过。
+
+完整测试初次因本机下载 SQLite 3.5.2 Windows 原生库连接中断而停止，随后复用本机已下载的同版本库，其 SHA-256 与包内 `asset_hashes.dart` 一致；没有复制任何已有包解析配置。此验证覆盖干净检出的依赖初始化，不表示本机原生库下载或 Ubuntu 远端运行已通过。
+
+### Windows SDK 初始化与 macOS 架构检查修复
+
+[CI #3](https://github.com/CKopoer/BiliSail/actions/runs/37408314360) 使用提交 `7c8684c8a6ea1dbb9aaacbb1ca723e3a5919f272`，Ubuntu 的完整分析与测试通过，进入三端构建。
+
+- [Windows 日志](https://github.com/CKopoer/BiliSail/actions/runs/37408314360/job/112092222074)：首次执行 `flutter --version --machine` 触发 SDK 内部 `pub upgrade`，其初始化输出混入标准输出，`ConvertFrom-Json` 在真正构建前失败。检查和构建脚本均先单独执行 `flutter --version` 并检查退出码，再捕获版本 JSON，避免依赖已初始化的本机 SDK。
+- [macOS 日志](https://github.com/CKopoer/BiliSail/actions/runs/37408314360/job/112092222062)：已编译出 `BiliSail.app`，随后 `lipo -verify_arch arm64 <file>` 将文件路径误当成架构名称而失败。Apple 的 `-verify_arch` 会消费后续所有架构参数，修复为 `lipo <file> -verify_arch arm64`；继续保留架构校验。
+
+本轮验证：两份脚本的旧逻辑均复现冷启动 JSON 失败，新逻辑均进入依赖安装，初始化失败的退出码也正确传播；共 6 个模拟 CLI 场景通过。`tool/check.ps1 -EnforceLockfile` 的全部格式、分析及 838 项测试通过，四份锁文件未变。Windows 实际执行 `tool/build-release.ps1 -Target windows-x64 -Version 0.1.0+1`，Release 编译、MakeAppx 打包及临时证书签名通过；包内容、manifest 和 3 份产物的 SHA-256 通过。旧输出目录已保存在 `artifacts/windows-x64-before-cli-fix-*/`，新输出仍位于 `artifacts/windows-x64/release/`。本机包基于 `7c8684c` 加本轮未提交修复，metadata 标记 `sourceDirty=true`。
+
+macOS 命令在本机用 LLVM lipo 对真实 arm64 Mach-O fixture 验证通过，错误架构被拒绝；此项不代替 Apple lipo/Xcode 的远端执行。两份脚本通过 PowerShell parser，两个工作流通过 actionlint 1.7.12。
+
+### 三端远端复验通过
+
+[CI #4](https://github.com/CKopoer/BiliSail/actions/runs/37409580779) 在 2026-10-06 对修复提交 `d818c8a8603f129b704b2e2238fc54ede88bded3` 全部通过，三个平台产物均已上传：
+
+| 任务 | 验证结果 |
+| --- | --- |
+| [Ubuntu 完整检查](https://github.com/CKopoer/BiliSail/actions/runs/37409580779/job/112094826410) | 根应用及三个包的依赖强校验、格式、分析和测试通过 |
+| [Windows x64](https://github.com/CKopoer/BiliSail/actions/runs/37409580779/job/112095782197) | 冷启动版本读取、Release 编译、MSIX 打包与临时证书签名、产物上传通过 |
+| [macOS arm64](https://github.com/CKopoer/BiliSail/actions/runs/37409580779/job/112095782269) | Xcode 编译、Apple lipo 架构校验、ZIP 打包与上传通过 |
+| [Android arm64](https://github.com/CKopoer/BiliSail/actions/runs/37409580779/job/112095782290) | Release split APK、单 arm64 ABI 断言、打包与上传通过 |
+
+**设备与发行未测**：macOS 启动、MSIX 安装/卸载/升级、正式 PFX 签名、Android 真机播放与签名升级。未创建或公开远端 Release；三端构建成功不能代替播放、设备与发行验收，M0 尚未全部完成。
+
+### Windows MSIX 任务栏图标透明背景修复
+
+2026-10-06 检查本机从 Release 安装的 `0.1.0+2` 包：品牌 PNG、EXE 的 ICO 和包内 `Logo44.png` 均保留透明通道，manifest 也已有 `BackgroundColor="transparent"`；但包内只有 `Logo44.png`、`Logo50.png`、`Logo150.png`，没有带 `targetsize` / `altform` 限定的图标或 `resources.pri`。
+
+本地直接运行 Release EXE 使用内嵌 ICO；安装 MSIX 后，Windows shell 使用 manifest 图标及其资源变体。缺少浅色或深色主题的无底板变体时，系统会缩小图标并添加底板，不能只靠 PNG alpha 或 manifest 的透明背景避免。依据：[Microsoft 图标变体要求](https://learn.microsoft.com/en-us/windows/apps/design/iconography/app-icon-construction)、[MSIX 无底板资源与 PRI](https://learn.microsoft.com/en-us/windows/msix/desktop/desktop-to-uwp-manual-conversion)。
+
+修复位于本地与 CI 共用的 `tool/build-release.ps1`：从原品牌 PNG 生成 15 个目标尺寸（16–256 像素）的普通、`unplated` 和 `lightunplated` 图标，显式使用透明的 32 位 ARGB；在 MakeAppx 打包前生成 PRI。索引只列出 MSIX 图标，保留 `Files/Assets/Logo44.png` 与 manifest 路径的对应关系；临时 `.resfiles` 清单不进入安装包。
+
+本轮在 Windows / Flutter 3.47.6 / Windows SDK 10.0.26100.0 下验证：
+
+- `tool/check.ps1 -EnforceLockfile` 的全部格式、分析及 840 项离线测试通过（根应用 599、API 206、播放器 16、弹幕 19）；四份锁文件无差异。
+- 实际运行 `tool/build-release.ps1 -Target windows-x64 -Version 0.1.0+3`，Release 编译、MakePri、MakeAppx 验证/打包、测试证书签名通过；产物在 `artifacts/windows-x64/release/`。此前输出保存在 `artifacts/windows-x64-before-taskbar-icon-*/`。
+- 从最终 MSIX 提取并用 MakePri 详细导出 PRI，验证 manifest 的 `Assets/Logo44.png` 对应正确的资源 URI、15 个尺寸的三类候选共 45 个，且每个候选指向包内实际 PNG。逐个验证图片尺寸、32 位 ARGB、四角 alpha 为 0 及中心非空；包内共 48 张 MSIX 图标，PRI 仅包含 3 个图标资源，不索引 Flutter 数据。
+- 完整原生运行文件、SHA-256、CMS 数学签名、导出公钥证书匹配及临时签名证书清理通过；临时资源清单与 PFX 未进入包。PowerShell parser、7 条本地文档链接和 `git diff --check` 通过。
+
+本地验证包基于 `19caedd` 加检出目录的未提交修改，metadata 标记 `sourceDirty=true`。本轮未替换已安装的 `0.1.0+2`，未安装新版做任务栏浅/深主题及不同 DPI 的显示复验，也未推送代码或重发远端 Release；此处的验证不代表新版安装、升级或受信任发行证书链已通过。
+
+### macOS 产物改为 DMG
+
+2026-10-06 按用户要求，将本地与 CI 共用打包脚本的 macOS 产物由 ZIP 改为 DMG，新增 Applications 拖拽安装入口，并在生成后执行镜像校验。Release 手动选项、草稿说明、README、文档索引及实施/决策文档同步更新；此前 CI #4 的 ZIP 成功记录保留为历史证据，不能用于证明新 DMG 流程已通过。
+
+本轮在 Windows / Flutter 3.47.6 下运行 `tool/check.ps1 -EnforceLockfile`：根应用及三个包的依赖、格式、分析和 989 项离线测试全部通过（根应用 723、API 227、播放器 16、弹幕 23），四份锁文件无差异。两个工作流通过 actionlint 1.7.12，两份 PowerShell 脚本通过语法检查；变更文档的本地链接及 `git diff --check` 通过。
+
+本机为 Windows，未执行 macOS/Xcode、`ditto` / `ln` / `hdiutil` 原生命令；实际 DMG 生成、挂载、拖拽安装、启动及 Gatekeeper 验收仍需 macOS runner 和设备复验。Developer ID 签名与公证仍未接入。
+
+### 定向依赖更新与 API 包 SDK 下限
+
+2026-10-07 按用户指定范围更新以下依赖，继续使用精确版本和 `https://pub.flutter-io.cn` 包源：
+
+| 依赖 | 位置 | 版本变化 |
+| --- | --- | --- |
+| `url_launcher` | 根应用直接依赖 | `6.3.2` → `6.3.3` |
+| `lints` | `bili_api` 开发依赖 | `6.0.0` → `6.1.0` |
+| `test` | `bili_api` 开发依赖 | `1.26.3` → `1.32.0` |
+| `jni_flutter` | `path_provider_android` 间接依赖 | `1.0.4` → `1.0.4+1` |
+
+`jni_flutter 1.0.4` 已被维护者撤回；通过根锁文件定向更新，不增加直接依赖或 `dependency_overrides`。根锁文件只更新上述两项运行时依赖。API 包锁文件同步更新新版 `test` 必需的 `analyzer`、`_fe_analyzer_shared`、`test_api`、`test_core`，移除不再需要的 `js`；其他依赖沿用已有解析版本。[JNI 版本记录](https://pub.dev/packages/jni_flutter/versions)、[测试工具版本记录](https://pub.dev/packages/test/changelog)。
+
+按用户要求，将 `bili_api` 的最低 Dart SDK 从 `3.7.0` 提高到 `3.11.0`，与新版测试工具要求对齐。保留新语言版本下的格式更新，并将 15 处条件集合元素改为等价的空值感知元素；字段为空时仍不加入请求参数或集合。主应用和其他包的 SDK 声明、CI 固定的 Flutter 3.47.6 / Dart 3.13.5 沿用原值。[新版 lint 说明](https://pub.dev/packages/lints/changelog)。
+
+本轮在 Windows 主机验证：
+
+- `tool/check.ps1 -EnforceLockfile` 通过根应用与三个包的格式、静态分析及 1191 项离线测试（根应用 868、API 269、播放器 22、弹幕 32）。
+- 对 37 个变更的 Dart 文件比较语法 token，排除格式空白和尾逗号后，只存在上述 15 处 lint 修正。
+- `flutter build apk --release --target-platform android-arm64 --split-per-abi` 通过，生成 `build/app/outputs/flutter-apk/app-arm64-v8a-release.apk`；检查 APK 的 6 个原生 `.so` 文件，ABI 仅为 `arm64-v8a`。
+- `flutter build windows --release` 通过，生成 `build/windows/x64/runner/Release/bilisail.exe` 及配套运行文件。
+- 四份锁文件在完整检查和两端构建前后的 SHA-256 一致；文档本地链接及 `git diff --check` 通过。
+
+Android 构建输出 CupertinoIcons 字体声明警告，Windows 构建输出 `flutter_inappwebview_windows` 的 CMake 开发者警告，两端均构建成功。未执行 Android 真机、macOS 构建/运行、安装升级或真实账号操作；构建和离线测试不能代替这些验收。
+
+
+### Android 紧凑版本编码（2026-10-10）
+
+根版本从 `0.5.5+1` 提升为 `0.5.5+2`。提交 `1e867206` 的父版本为 `0.5.3+7`，该提交改为 `0.5.4+1`；旧编码只使用构建号加 arm64 偏移，造成版本升级时 versionCode 回退。已读取公开 Release 的 `0.5.3+7` 与 `0.5.5+1` build-info，分别记录 2007、2001，签名证书 SHA-256 均为 `be3770071a0e9c71a701405a685dd455cd1baa134abd2eac2d97b9926349996e`。新编码预期 5502 高于两者；固定签名配置保持不变。
+
+[版本回归脚本](../../tool/test-android-version.ps1) 已接入 `tool/check.ps1`，覆盖构建号/补丁/次版本/主版本进位、历史升级、最大值、范围与格式拒绝，以及实际 APK 元数据中的错误 ABI 偏移、旧编码、错误包名和 versionName。元数据校验在签名校验和上传之前执行。Release 工作流仍由手动触发，默认创建 draft + prerelease；本次用户授权的公开并设为 Latest 操作在产物核验后单独执行，不改变后续发布策略。
+
+
+本轮云端 Linux 本地验证：新增版本/manifest 校验 34 项、原有 Android 签名 21 项、Windows 版本 14 项、macOS 发布检查 22 项通过；从实际 Gradle 脚本提取的 Kotlin 版本函数通过 22 项边界用例；全部 PowerShell 脚本语法解析、actionlint 1.7.12 和 `git diff --check` 通过。另下载历史两份 APK 并解析二进制 AndroidManifest.xml，确认 `0.5.3` / `2007` 和 `0.5.5` / `2001`，包名均为 `dev.bilisail.bilisail`，与历史 build-info 一致。
+
+本地未完成根应用/包的 Flutter 格式、分析、测试或三端构建：环境未安装 Flutter，固定 SDK 源码下载成功，但 Dart SDK 下载被网络代理以 HTTP 403 拒绝。`tool/check.ps1 -EnforceLockfile` 的 PowerShell 检查已运行，Flutter 阶段无法启动；完整验证须由后续远端 CI 提供。没有执行 Android 真机覆盖安装、数据保留或播放验收。
+
+
+### 统一官方 Pub 源（2026-10-11）
+
+本次仅将 CI 和五份锁文件中的 hosted 源从 `https://pub.flutter-io.cn` 迁移到 `https://pub.dev`，保留各依赖版本、约束和内容 SHA-256；不执行 `pub upgrade`，应用版本保持 `0.5.6+2`。根锁文件迁移 128 个 hosted 条目，`bili_api` 50 个、`bili_player` 57 个、`bili_danmaku` 23 个、`bili_mux` 24 个。历史镜像配置和失败记录保留在上文，不能视为当前配置。
+
+[Dependabot PR #5](https://github.com/CKopoer/BiliSail/pull/5) 同时包含包源及 drift/间接依赖升级；本次没有合并或照搬该 PR 的锁文件。此前其 CI 的来源冲突发生于镜像环境与官方来源锁文件之间；统一官方源后仍需分别检查后续 PR 的依赖变更和 CI 结果。
+
+
+迁移前后逐份解析锁文件，确认只有 282 个 hosted URL 改变，其他字段完全一致；155 个不同的已锁定包名/版本均与 `pub.dev` API 返回的 `archive_sha256` 一致，原有效哈希全部保留。工作流通过 actionlint 1.7.12。Dart 来源规范化依据固定 SDK 3.13.5 的 [DEPS](https://github.com/dart-lang/sdk/blob/3.13.5/DEPS) 所引用的 Pub 提交，不以两个官方域名的文本相等为判断标准。本地环境缺少 Flutter/PowerShell，未在本地执行固定 SDK 的解析和完整 `tool/check.ps1`；实际严格锁文件检查与三端构建由本次推送触发的 CI 验证。
+
+### 下载速度回归测试时序修复（2026-10-11）
+
+[CI 38112987859](https://github.com/CKopoer/BiliSail/actions/runs/38112987859/job/114392259775) 的提交为 `8e74438e29b7efa0626768627408d294dc2712bb`。严格锁文件检查、格式和静态分析通过，根应用 1840 项测试通过、1 项失败；失败为 [下载仓储测试](../../test/features/downloads/sqlite_download_repository_test.dart) 的 `streaming progress publishes a nonzero transfer speed`，第 247 行预期观察到非零速度，实际为 `false`。后续包检查和三端构建因此没有执行，独立 MP4 原生回归已通过。
+
+该用例使用真实服务器每隔 650 毫秒发送小块数据，并每隔 20 毫秒轮询当前状态；仓储则以客户端进度回调建立基线，至少间隔 500 毫秒才计算速度，完成时清零。服务器发送间隔不能保证客户端回调间隔，轮询也不能保证观察到短暂状态。[IOSink.flush](https://api.dart.dev/dart-io/IOSink/flush.html) 只保证底层 consumer 接受数据，不保证操作系统已发送；[HttpResponse.bufferOutput](https://api.dart.dev/dart-io/HttpResponse/bufferOutput.html) 默认开启。本机旧用例单独运行通过，但测试没有约束这些调度和缓冲条件。
+
+修复只调整测试：使用仓储已有的可注入时钟，测试服务器关闭输出缓冲，并等待客户端发布当前块的进度后才允许发送下一块。断言通过 `changes` 订阅检查首次采样为零、250 毫秒时仍为零、500 毫秒时速度为 2048 字节/秒，以及双轨完整下载后速度清零。每次状态等待有 5 秒超时，失败清理释放发送门闩；下载实现、500 毫秒采样规则和 CI 工作流保持原值。
+
+Windows x64、Flutter 3.47.6：修复后的定向用例和全部 53 项下载回归通过。完整 `tool/check.ps1 -EnforceLockfile` 通过格式、静态分析和 2360 项测试（根应用 1841、API 390、播放器 41、弹幕 86、MP4 2）；未设置 `BILI_MUX_LIBRARY` 的 7 项原生测试按既有规则跳过。五份锁文件没有变化，本节相对链接和 `git diff --check` 通过。本机没有应用构建、安装或实机下载验收；远端 CI 与三端构建以修复提交对应的工作流结果为准。
+
+## 2026-10-11：允许构建号零
+
+版本解析、Android Gradle 与 Windows MSI 校验均接受非负构建号，保留禁止前导零及平台上界。`1.0.2+0` 直接映射为 MSIX／EXE `1.0.2.0`、MSI `1.0.2000`，Android versionName 为 `1.0.2`、versionCode 为 `10200`；不附加 ABI 偏移。macOS 继续传入 build name `1.0.2` 和 build number `0`。Android 编码高于上一版 `0.5.7+5` 的 `5705`，签名配置不变。MSIX 的四段映射不变；本版本首段非零、末段为零，不代表已提交或通过 Microsoft Store 验证。
+
+边界回归覆盖 `+0`、负数、前导零及既有上界拒绝。各平台打包时核验实际包／bundle 版本，并写入 build-info；CI 构建成功与 GitHub Release 创建／发布分别核验，不能相互替代。
+
+Flutter 3.47.6 会将 Android 的 `--build-number 0` 归一化为 `1`（[固定 SDK 实现](https://github.com/flutter/flutter/blob/5fc346839b/packages/flutter_tools/lib/src/build_info.dart)）。因此 Gradle 优先从打包脚本已有的 `--dart-define=BILISAIL_RELEASE_VERSION=x.y.z+N` 读取原始构建号，校验名称一致后按同一公式编码；没有该 define 时保持 Flutter 默认来源。自行执行 Flutter 构建 `+0` 时也必须传入这个完整版本 define。首次 `1.0.2+0` CI 的 APK 校验已拦截该归一化造成的错误，新增 `10201` 拒绝回归，禁止将偏一的包上传。
+
+## 2026-10-12：固定 Microsoft Store 包身份
+
+用户确认的商店字段为 Name `JerryHsu.BiliSail`、Publisher `CN=D34F8E82-088B-4DC8-9296-620B8683A539`、PublisherDisplayName `Jerry Hsu`，目标 PFN 为 `JerryHsu.BiliSail_e5wcspfxwa6kj`。原模板已包含正确值，但 Actions 变量 `MSIX_PUBLISHER=CN=BiliSail` 在打包时覆盖 Publisher，导致 Store 同时报 Publisher 与 PFN 错误。
+
+现在 CI 不再传入该变量，打包脚本不再接受覆盖，并通过 [身份校验](../../tool/windows-msix-identity.ps1) 检查源模板与实际 MSIX manifest 的三个身份字段及版本；实际读取的字段写入 `build-info.json` 的 `windowsMsixIdentity`。Windows 打包时通过系统 `PackageFamilyNameFromId` 从实际 Name 与 Publisher 派生 PFN，并与目标值比对，记录到 metadata；不向 manifest 添加虚构 PFN 字段。签名后校验包内 PKCS#7/CMS 的数学签名及签名证书与所选证书一致；该校验不声明系统信任链通过，也不修改证书信任区。回归覆盖旧变量隔离、错误 Publisher／Name／显示名／版本拒绝，并接入 `tool/check.ps1`。
+
+已配置签名证书仍须匹配固定 Publisher，不自动替换密钥、不降级签名；需要维护者在 Actions Secrets 安全更新 PFX 及对应密码。身份变化后的 MSIX 不应视为原错误 PFN 侧载包的直接升级。版本号、runFullTrust 与依赖不变；本修改不自动提交 Store，也不替换已有 Release 资产。
+
+## 2026-10-25：桌面原生返回测试在 Ubuntu 上等待回调
+
+[CI #130](https://github.com/CKopoer/BiliSail/actions/runs/40175802170/job/121116147931) 的提交为 `353164f7cf85f74402516f2bc7ceea961ac1a843`。根检查运行于 Ubuntu，`WindowService` 只在 Windows/macOS 注册原生返回消息处理器；播放窗测试却要求 `setBackButton` 已被调用，图片查看器和独立播放窗路由测试也直接等待原生返回回复。`ChannelBuffers.push` 会暂存没有监听器的消息，辅助函数的等待无法结束，日志中的首个图片查看器用例因此耗尽默认 10 分钟超时，后续平台构建仍被检查任务阻塞。
+
+修复仅调整测试：共享假窗口显式提供原生返回能力，在各测试主机通过模拟平台通道验证实际的消息注册、按 view 路由及模态隔离；生产平台判断保持原值。消息辅助函数改用 `TestDefaultBinaryMessenger.handlePlatformMessage`，缺少处理器时立即报出对应 view 的错误，并解码回复以保留平台异常。新增回归覆盖不支持原生返回时的快速失败、无残留排队消息及错误回复；原有两项原生返回服务测试也可在 Ubuntu 执行。
+
+Windows x64 / Flutter 3.47.6 的 61 项定向测试通过；`tool/check.ps1 -SkipPub` 的格式、静态分析、打包边界检查及 2867 项测试通过（根应用 2245、API 446、播放器 81、弹幕 93、封装包 2），10 项 mux 原生用例因未配置 `BILI_MUX_LIBRARY` 跳过。按用户要求停止本地 Ubuntu 环境准备，修复推送后的 Ubuntu 检查及三端构建以对应 GitHub CI 为准；本轮没有安装、实机或性能验证，未发现可连接的调试应用，热重载未完成。
+
+## 2026-10-25：检查并行化与根测试审查
+
+[优化前的检查任务](https://github.com/CKopoer/BiliSail/actions/runs/40189663272/job/121157790929) 约耗时 8 分 20 秒，其中根应用 2316 项测试约占 5 分 56 秒，根分析约 40 秒，四个包的格式、分析和测试合计约 60 秒。SDK 和 Pub 缓存均已命中，没有长时间卡住或超时的测试。
+
+CI 现在并行运行以下任务，全部完成后由原名 `Analyze and test` 汇总；失败、取消或跳过任一检查任务均不能让汇总通过。三个平台的构建仍依赖该汇总与独立原生 mux 回归。
+
+| 阶段 | 范围 |
+| --- | --- |
+| `Lint` | 打包边界脚本、根应用与四个包的格式、一次覆盖全仓的静态分析 |
+| `RootTests` × 2 | Flutter 内置分片，索引 0/1，总分片数 2；保留全部根测试 |
+| `PackageTests -SkipMuxTests` | API、播放器和弹幕包的测试；mux 的全部测试由独立原生任务执行 |
+
+删除逐包重复分析，以及普通检查中被独立原生任务完整覆盖的 mux 测试运行。每个任务仍先进行严格锁文件解析；后续 Flutter 分析和测试使用 `--no-pub` 避免再次解析。该参数仅用于检查命令，构建继续保留默认 Pub 阶段，避免跳过原生插件注册文件生成。
+
+本地完整检查默认仍包含四个包的测试，不需要传入阶段参数。分片参数只接受 `RootTests`；`SkipMuxTests` 只接受 `PackageTests`，用于已有独立原生回归兜底的 CI。
+
+```powershell
+.\tool\check.ps1 -EnforceLockfile
+.\tool\check.ps1 -Stage Lint -EnforceLockfile
+.\tool\check.ps1 -Stage RootTests -TotalShards 2 -ShardIndex 0 -EnforceLockfile
+.\tool\check.ps1 -Stage RootTests -TotalShards 2 -ShardIndex 1 -EnforceLockfile
+.\tool\check.ps1 -Stage PackageTests -SkipMuxTests -EnforceLockfile
+```
+
+根测试审查覆盖当前 `test/` 下 200 个测试文件，检查重复测试体、缺少直接断言的测试、退役导航配置、平台跳过、预览导出和显式等待，并复核工作区路由、播放控件、首页滑动及布局相关用例。未找到可直接删除且不损失独立行为覆盖的整项测试：
+
+- `singlePage` 用例验证旧设置迁移，继续保留；Windows 专用跳过项仍验证平台能力。
+- 下载页面纯截图用例已由 `DOWNLOAD_PREVIEW_DIR` 显式启用，不在默认 CI 注册。
+- 首页封面滑动矩阵覆盖不同数据路径、缓存开关及宽窄布局，保留全部组合；播放、会话隔离、导航、存储和协议测试继续执行。
+- 悬停视频和推荐反馈测试原本默认编码、写出 PNG，没有 golden 比对或 CI 产物消费。改为仅在 `--dart-define=WRITE_UI_PREVIEW=true` 时导出，默认仍执行布局、视频 surface 和交互断言。
+- 悬停视频布局用例按主题场景分别创建 fake 播放服务，以虚拟时间推进淡入，去掉固定 20 次真实等待；每个场景结束卸载组件，避免前一个会话释放影响后一个场景。
+
+并行分片增加同时运行的 runner 数量，实际远端耗时与分片均衡程度须在新 CI 运行后确认；不能把预计提速作为已测结果。
+
+本轮 Windows x64 / Flutter 3.47.6 验证：
+
+- 两份根测试分片分别通过 1349、1250 项，合计 2599 项；四个包通过 632 项测试（API 456、播放器 81、弹幕 93、封装 2），10 项 mux 原生用例因未配置 `BILI_MUX_LIBRARY` 跳过。
+- 修改的两份测试默认运行通过 18 项，且六张既有预览 PNG 的修改时间均未改变；显式开启导出后连同登录 WebView 定向复测共通过 29 项，六张 PNG 均正常生成。
+- 在四个包的 `lib/test` 分别临时加入一个未定义符号，根分析确认报告全部八个错误，随后清理探针；验证合并分析仍覆盖各包。阶段路由、非法参数拒绝、命令失败传播和目录恢复检查通过，汇总检查的 17 种成功／失败／取消／跳过／缺失结果组合通过。两份工作流通过 actionlint 1.7.12。
+- 首次 `tool/check.ps1 -EnforceLockfile` 的依赖强校验、格式和分析通过，根测试有一项登录 WebView 用例未在其轮询窗口内出现控件；该文件随后定向复测及上述分片均通过。第二次 `tool/check.ps1 -SkipPub` 复跑期间，工作区出现同期 Android 导航修改，`playback_panel_test.dart` 的 `workspace scopes players and enforces dualTabs playback (concurrent: false)` 仍点击已隐藏返回栏的“返回上一视频”，在第 900 行失败，之后停止该次运行；这两次运行均不计为完整检查通过。
+- 同期导航工作随后将相关播放测试改为系统返回操作，对应四项定向测试通过。最后一次 `tool/check.ps1 -SkipPub` 完整通过格式、统一分析、打包边界检查和 3232 项测试（根应用 2600、API 456、播放器 81、弹幕 93、封装 2）；10 项 mux 原生用例按配置跳过。没有为 CI 提速删除上述回归或改动同期导航实现，五份锁文件保持原值。
+
+上述分片数量对应同期导航修改前的测试快照；工作区原有及同期修改均保留。此轮未提交或推送，未运行新工作流、客户端构建、安装、在线或实机验证；远端检查耗时仍待新 CI 实测。
+
+## 2026-11-07：Apple 构建显式选择 Xcode 26.2
+
+[CI #309](https://github.com/CKopoer/BiliSail/actions/runs/42349410990) 对应提交 `d777e06e2a1c46fc217bd05e3510dbf17cc5d1c1`。格式／分析、两份根测试分片、包测试、原生 mux 回归，以及 Windows／Android／Linux 构建通过；[macOS x64](https://github.com/CKopoer/BiliSail/actions/runs/42349410990/job/128336700736)、[macOS arm64](https://github.com/CKopoer/BiliSail/actions/runs/42349410990/job/128336700776) 和 [iOS arm64](https://github.com/CKopoer/BiliSail/actions/runs/42349410990/job/128336700765) 均在编译 `video_player_avfoundation 2.12.3` 时失败。首个错误为 `AVFactory.swift` 中 `AVAsset.load(_:isolation:)` 的 `extra argument 'isolation' in call`；`VideoPlayer.swift` 的同类错误与泛型推导错误也是这个 SDK 不匹配的结果。
+
+依赖由固定的 `fvp` 经 `video_player` 引入，仍由 Flutter 注册和编译 Apple 原生插件。该版本调用了带 actor isolation 参数的 AVFoundation API，但三个失败任务实际使用 Xcode 16.4／macOS 15.5 或 iOS 18.5 SDK。Apple 的 [API 声明](https://developer.apple.com/documentation/avfoundation/avasynchronouskeyvalueloading/load(_:isolation:))包含 `@backDeployed(before: macOS 26.0, iOS 26.0, ...)`；新 SDK 的编译接口和应用最低运行版本是不同约束。
+
+对应运行的 [Intel 镜像清单](https://github.com/actions/runner-images/blob/macos-15/20260824.0482/images/macos/macos-15-Readme.md)和 [arm64 镜像清单](https://github.com/actions/runner-images/blob/macos-15-arm64/20261104.0514/images/macos/macos-15-arm64-Readme.md)均列出 Xcode 26.2，同时默认版本仍为 16.4。CI 现在对三个 Apple 目标，在 Flutter 初始化和 mux／应用构建前设置并持久化 `DEVELOPER_DIR=/Applications/Xcode_26.2.app/Contents/Developer`；检查目录存在后打印 Xcode、Swift、macOS SDK 和 iOS SDK 版本。指定工具链缺失或诊断命令失败时立即停止，避免静默使用默认版本。Release 补建复用同一 CI 工作流，因此采用相同选择。
+
+本轮 Windows x64／Flutter 3.47.6 验证：`tool/check.ps1 -EnforceLockfile` 完整通过打包边界、五份锁文件严格解析、格式、静态分析和 5628 项 Dart／Flutter 测试（根应用 4572、API 678、播放器 212、弹幕 161、封装 5）。根应用 13 项按原有条件跳过；未配置 `BILI_MUX_LIBRARY`，mux 的 10 项原生测试跳过，不计作原生通过。五份锁文件无修改，日志为 `build/ci-42349410990-fix-check.log`。
+
+CI／Release 工作流通过 actionlint 1.7.12；直接执行新增的生产 Bash 步骤，以模拟 Apple 命令验证工具链路径传递至当前及后续步骤、缺少指定目录时停止，以及 Xcode 命令失败时停止。本文 45 条本地链接及 `git diff --check` 通过。本机为 Windows，无法执行真实 Xcode／Apple SDK 编译、DMG／IPA 打包或 Apple 设备验证；修复后的三个远端构建结果仍待新 CI 确认。

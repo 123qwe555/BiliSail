@@ -1,0 +1,464 @@
+import '../../../domain/user.dart';
+
+import 'package:bili_api/bili_api.dart';
+
+import '../../../shared/data/video_access_mapper.dart';
+
+import '../../../core/network/api_requests.dart';
+import '../../../domain/page_result.dart';
+import '../../../domain/request_cancellation.dart';
+import '../../../domain/video.dart';
+import '../../../domain/recommendation_source.dart';
+import '../../../domain/app_failure.dart';
+import 'app_recommendation_identity_store.dart';
+import '../../video/domain/video_actions_repository.dart';
+import '../domain/feed_repository.dart';
+import '../domain/popular_feed.dart';
+
+class ApiFeedRepository
+    implements
+        FeedRepository,
+        PopularFeedRepository,
+        RankingFeedRepository,
+        RecommendationPublicationTimeRepository,
+        AppRecommendationFeedRepository,
+        RecommendationFeedbackRepository {
+  ApiFeedRepository(this.api, this.requests, {this.appIdentity});
+  final AppRecommendationIdentityStore? appIdentity;
+  final BiliApiClient api;
+  final ApiRequests requests;
+
+  int _recommendationIndex = 0;
+  // A refresh owns a new cancellation scope. Weak keys retain failed-page
+  // indices for explicit retries without retaining closed query lifetimes.
+  final _recommendationPulls = Expando<_RecommendationPull>();
+
+  @override
+  String get feedbackScope => 'session:${requests.sessionEpoch}';
+
+  @override
+  Future<void> rejectRecommendation(
+    RecommendationFeedback feedback, {
+    required RequestCancellation cancellation,
+  }) => _submitFeedback(feedback, undo: false, cancellation: cancellation);
+
+  @override
+  Future<void> undoRecommendationFeedback(
+    RecommendationFeedback feedback, {
+    required RequestCancellation cancellation,
+  }) => _submitFeedback(feedback, undo: true, cancellation: cancellation);
+
+  Future<void> _submitFeedback(
+    RecommendationFeedback feedback, {
+    required bool undo,
+    required RequestCancellation cancellation,
+  }) => requests.run((context) async {
+    try {
+      if (feedback.source == RecommendationSource.app) {
+        final store = appIdentity;
+        if (store == null) {
+          throw const ApiFailure(
+            ApiFailureCategory.unavailable,
+            'app_feedback',
+          );
+        }
+        final identity = await store.requestIdentity();
+        final token = identity.accessToken;
+        if (identity.revision != feedback.identityRevision) {
+          throw const ApiFailure(ApiFailureCategory.cancelled, 'app_feedback');
+        }
+        if (token == null) {
+          throw const AppFailure(
+            AppFailureKind.authentication,
+            '请在账号菜单重新登录后再反馈 App 推荐',
+          );
+        }
+        final reason = feedback.selectedReason;
+        await AppRecommendationClient(api).feedback(
+          aid: feedback.aid,
+          buvid: identity.buvid,
+          accessToken: token,
+          goto: feedback.goto,
+          undo: undo,
+          reason: reason == null
+              ? null
+              : ApiAppFeedbackReason(
+                  id: reason.id,
+                  name: reason.name,
+                  kind: reason.kind == RecommendationFeedbackReasonKind.dislike
+                      ? ApiAppFeedbackKind.dislike
+                      : ApiAppFeedbackKind.feedback,
+                ),
+          context: context,
+        );
+        if (identity.revision != store.revision) {
+          throw const ApiFailure(ApiFailureCategory.cancelled, 'app_feedback');
+        }
+        return;
+      }
+      final client = FeedCardActionsClient(api);
+      final value = ApiRecommendationFeedback(
+        aid: feedback.aid,
+        goto: feedback.goto,
+        trackId: feedback.trackId,
+        ownerMid: feedback.ownerMid,
+      );
+      if (undo) {
+        await client.undoRecommendationFeedback(value, context: context);
+      } else {
+        await client.rejectRecommendation(value, context: context);
+      }
+    } on ApiFailure catch (failure) {
+      if (context.cancellation?.isCancelled != true &&
+          {
+            ApiFailureCategory.network,
+            ApiFailureCategory.timeout,
+            ApiFailureCategory.http,
+            ApiFailureCategory.protocol,
+          }.contains(failure.category)) {
+        throw const UnknownWriteOutcome();
+      }
+      rethrow;
+    }
+  }, cancellation: cancellation);
+
+  @override
+  Future<PageResult<VideoSummary>> loadAppRecommendations({
+    required int page,
+    required RequestCancellation cancellation,
+  }) => requests.run((context) async {
+    final store = appIdentity;
+    if (store == null) {
+      throw const ApiFailure(ApiFailureCategory.unavailable, 'app_recommended');
+    }
+    final identity = await store.requestIdentity();
+    ApiPage<ApiAppRecommendation> result;
+    try {
+      result = await AppRecommendationClient(api).load(
+        page: page,
+        buvid: identity.buvid,
+        accessToken: identity.accessToken,
+        appAccountMid: identity.accountMid,
+        context: context,
+      );
+    } on ApiFailure catch (failure) {
+      if (failure.category == ApiFailureCategory.authentication &&
+          identity.accessToken != null &&
+          identity.revision == store.revision) {
+        await store.invalidateAuthorization();
+      }
+      rethrow;
+    }
+    if (identity.revision != store.revision) {
+      throw const ApiFailure(ApiFailureCategory.cancelled, 'app_recommended');
+    }
+    return PageResult(
+      hasMore: result.hasMore,
+      items: List.unmodifiable(
+        result.items.map((item) {
+          final video = item.video;
+          return VideoSummary(
+            id: VideoId(
+              item.cardGoto == 'av'
+                  ? video.bvid
+                  : 'app:${item.cardGoto}:${item.param}',
+            ),
+            recommendationTarget: _appRecommendationTarget(item),
+            title: video.title,
+            coverUrl: video.coverUrl?.toString() ?? '',
+            author: video.ownerName,
+            authorId: UserId.tryParse(video.ownerMid),
+            duration: video.duration,
+            previewCid: video.previewCid,
+            playCount: video.playCount,
+            danmakuCount: video.danmakuCount,
+            publishedAt: video.publishedAt,
+            likeCount: video.likeCount,
+            categoryName: video.categoryName,
+            isFollowed: video.isFollowed,
+            recommendationReason: video.recommendationReason,
+            recommendationFeedback: RecommendationFeedback.app(
+              aid: item.param,
+              goto: item.cardGoto,
+              ownerMid: video.ownerMid ?? '0',
+              identityRevision: identity.revision,
+              reasons: item.reasons
+                  .map(
+                    (reason) => RecommendationFeedbackReason(
+                      id: reason.id,
+                      name: reason.name,
+                      kind: reason.kind == ApiAppFeedbackKind.dislike
+                          ? RecommendationFeedbackReasonKind.dislike
+                          : RecommendationFeedbackReasonKind.feedback,
+                    ),
+                  )
+                  .toList(),
+            ),
+          );
+        }),
+      ),
+    );
+  }, cancellation: cancellation);
+
+  @override
+  Future<DateTime?> loadPublicationTime(
+    VideoId id, {
+    required RequestCancellation cancellation,
+  }) => requests.run(
+    (context) async =>
+        (await api.getVideoDetail(id.value, context: context)).publishedAt,
+    cancellation: cancellation,
+  );
+
+  static RecommendationTarget? _appRecommendationTarget(
+    ApiAppRecommendation item,
+  ) {
+    if (item.cardGoto == 'av') return null;
+    if (item.cardGoto == 'bangumi') {
+      return RecommendationTarget(
+        kind: RecommendationTargetKind.episode,
+        id: item.param,
+      );
+    }
+    final uri = item.navigationUri;
+    if (uri != null && uri.userInfo.isEmpty) {
+      final parts = uri.pathSegments.where((part) => part.isNotEmpty).toList();
+      String? positiveId(String? value) =>
+          value != null && RegExp(r'^[1-9][0-9]{0,19}$').hasMatch(value)
+          ? value
+          : null;
+      if (uri.scheme == 'bilibili') {
+        if (uri.host == 'video' && parts.length == 1) {
+          final value = parts.single;
+          final bvid = VideoId(value).isValid
+              ? value
+              : VideoIdentifiers.bvidFromAid(value);
+          if (bvid != null) {
+            return RecommendationTarget(
+              kind: RecommendationTargetKind.video,
+              id: bvid,
+            );
+          }
+        }
+        if (uri.host == 'bangumi' &&
+            parts.length == 2 &&
+            parts.first == 'season') {
+          final id = positiveId(parts.last);
+          if (id != null) {
+            return RecommendationTarget(
+              kind: RecommendationTargetKind.season,
+              id: id,
+            );
+          }
+        }
+        if (uri.host == 'bangumi' &&
+            parts.length == 2 &&
+            parts.first == 'play' &&
+            parts.last.startsWith('ep')) {
+          final id = positiveId(parts.last.substring(2));
+          if (id != null) {
+            return RecommendationTarget(
+              kind: RecommendationTargetKind.episode,
+              id: id,
+            );
+          }
+        }
+        if (parts.length == 1) {
+          final id = positiveId(parts.single);
+          if (id != null && uri.host == 'live') {
+            return RecommendationTarget(
+              kind: RecommendationTargetKind.live,
+              id: id,
+            );
+          }
+          if (id != null &&
+              const {'following', 'opus', 'dynamic'}.contains(uri.host)) {
+            return RecommendationTarget(
+              kind: RecommendationTargetKind.dynamic,
+              id: id,
+              url: Uri.https('t.bilibili.com', '/$id'),
+            );
+          }
+        }
+      }
+      if (uri.scheme == 'https' &&
+          uri.port == 443 &&
+          const {
+            'www.bilibili.com',
+            'live.bilibili.com',
+            't.bilibili.com',
+            'space.bilibili.com',
+          }.contains(uri.host)) {
+        return RecommendationTarget(
+          kind: RecommendationTargetKind.external,
+          url: uri,
+        );
+      }
+    }
+    return const RecommendationTarget(
+      kind: RecommendationTargetKind.unsupported,
+    );
+  }
+
+  @override
+  Future<List<VideoCategory>> loadCategories({
+    required RequestCancellation cancellation,
+  }) async => const [
+    VideoCategory(id: '1', name: '动画'),
+    VideoCategory(id: '3', name: '音乐'),
+    VideoCategory(id: '4', name: '游戏'),
+    VideoCategory(id: '5', name: '娱乐'),
+    VideoCategory(id: '36', name: '知识'),
+    VideoCategory(id: '188', name: '科技'),
+    VideoCategory(id: '160', name: '生活'),
+    VideoCategory(id: '211', name: '美食'),
+    VideoCategory(id: '217', name: '动物圈'),
+    VideoCategory(id: '119', name: '鬼畜'),
+    VideoCategory(id: '155', name: '时尚'),
+    VideoCategory(id: '181', name: '影视'),
+  ];
+
+  @override
+  Future<List<VideoCategory>> loadRankingCategories({
+    required RequestCancellation cancellation,
+  }) => requests.run((context) async {
+    final regions = await RankingClient(api).getRegions(context: context);
+    return List.unmodifiable([
+      for (final region in regions)
+        VideoCategory(id: region.id, name: region.name),
+    ]);
+  }, cancellation: cancellation);
+
+  @override
+  Future<PageResult<VideoSummary>> loadFeed({
+    required int page,
+    required String? categoryId,
+    required RequestCancellation cancellation,
+  }) => requests.run((context) async {
+    if (categoryId != null) {
+      return _mapPage(
+        await api.getRegionalVideos(
+          categoryId: categoryId,
+          page: page,
+          context: context,
+        ),
+      );
+    }
+    if (page < 1) throw ArgumentError.value(page, 'page');
+    final epoch = requests.sessionEpoch;
+    final pending = _recommendationPulls[cancellation];
+    final pull =
+        pending != null && pending.page == page && pending.epoch == epoch
+        ? pending
+        : _RecommendationPull(page, ++_recommendationIndex, epoch);
+    _recommendationPulls[cancellation] = pull;
+    final result = _mapPage(
+      await api.getRecommended(page: pull.index, context: context),
+    );
+    // An empty success also consumes its sample. A late old response must not
+    // clear the retry index of a newer page or account session.
+    if (!cancellation.isCancelled &&
+        epoch == requests.sessionEpoch &&
+        identical(_recommendationPulls[cancellation], pull)) {
+      _recommendationPulls[cancellation] = null;
+    }
+    return result;
+  }, cancellation: cancellation);
+
+  @override
+  Future<PageResult<VideoSummary>> loadRanking({
+    required String categoryId,
+    required RequestCancellation cancellation,
+  }) => requests.run(
+    (context) async => _mapPage(
+      await api.getRanking(categoryId: categoryId, context: context),
+    ),
+    cancellation: cancellation,
+  );
+
+  @override
+  Future<PageResult<VideoSummary>> loadPopular({
+    required int page,
+    required RequestCancellation cancellation,
+  }) => requests.run((context) async {
+    final result = await api.getPopular(page: page, context: context);
+    return _mapPage(result);
+  }, cancellation: cancellation);
+
+  @override
+  Future<List<PopularWeek>> loadPopularWeeks({
+    required RequestCancellation cancellation,
+  }) => requests.run((context) async {
+    final weeks = await api.getPopularWeeks(context: context);
+    return List.unmodifiable([
+      for (final week in weeks)
+        PopularWeek(
+          number: week.number,
+          name: week.name,
+          subject: week.subject,
+        ),
+    ]);
+  }, cancellation: cancellation);
+
+  @override
+  Future<PageResult<VideoSummary>> loadPopularWeek({
+    required int number,
+    required RequestCancellation cancellation,
+  }) => requests.run(
+    (context) async =>
+        _mapPage(await api.getPopularWeek(number: number, context: context)),
+    cancellation: cancellation,
+  );
+
+  @override
+  Future<PageResult<VideoSummary>> loadPrecious({
+    required RequestCancellation cancellation,
+  }) => requests.run(
+    (context) async => _mapPage(await api.getPreciousVideos(context: context)),
+    cancellation: cancellation,
+  );
+
+  PageResult<VideoSummary> _mapPage(ApiPage<ApiVideoSummary> result) =>
+      PageResult(
+        items: result.items
+            .map(
+              (item) => VideoSummary(
+                id: VideoId(item.bvid),
+                access: mapVideoAccess(item.access),
+                previewCid: item.previewCid,
+                title: item.title,
+                coverUrl: item.coverUrl?.toString() ?? '',
+                author: item.ownerName,
+                authorAvatarUrl: item.ownerAvatarUrl,
+                authorId: UserId.tryParse(item.ownerMid),
+                duration: item.duration,
+                playCount: item.playCount,
+                likeCount: item.likeCount,
+                categoryName: item.categoryName,
+                isFollowed: item.isFollowed,
+                danmakuCount: item.danmakuCount,
+                publishedAt: item.publishedAt,
+                recommendationReason: item.recommendationReason,
+                recommendationFeedback: switch (item.recommendationFeedback) {
+                  final feedback? => RecommendationFeedback(
+                    aid: feedback.aid,
+                    goto: feedback.goto,
+                    trackId: feedback.trackId,
+                    ownerMid: feedback.ownerMid,
+                  ),
+                  null => null,
+                },
+              ),
+            )
+            .toList(growable: false),
+        hasMore: result.hasMore,
+      );
+}
+
+final class _RecommendationPull {
+  const _RecommendationPull(this.page, this.index, this.epoch);
+
+  final int page;
+  final int index;
+  final int epoch;
+}

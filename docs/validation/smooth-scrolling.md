@@ -1,0 +1,77 @@
+# 全局桌面滚轮平滑过渡
+
+初版日期：2026-10-05；连续输入修正及速度驱动改版：2026-10-06；官方模拟器改版：2026-10-17；滚轮时间戳与帧对齐：2026-10-31。工具链：Flutter 3.47.6 / Dart 3.13.5。
+
+2026-10-31 修正连续输入使用上一帧时间重新定向弹簧的问题：现在按事件时间推进旧模拟器、保留未绘位移，每帧一次提交位置；晚于当前 vsync 的事件在有上限的本地队列中等待相应帧。仍使用同一官方弹簧、阻尼设置及单一 Ticker，详细定位与两列／六列 Windows Profile 对照见[滚轮时序验证](wheel-scroll-timing-2026-10-31.md)。
+
+## 行为与接入
+
+根应用的 `MaterialApp.router.scrollBehavior` 使用共享 `SmoothScrollBehavior`，为普通桌面滚动区域增加连续的滚轮过渡。2026-10-17 按用户要求使用 Flutter 官方 `ScrollSpringSimulation` 替换自定义双速度积分公式，由模拟器计算位置、速度与结束条件，继续复用 Flutter 的 `ScrollActivity` 生命周期，未新增依赖。后续同日将滚轮阻尼比接入既有设置与持久化。首页、搜索、动态、用户空间、评论、设置、选集以及继承应用滚动行为的弹窗使用同一实现，列表保留自己的控制器、滚动物理模型和 PageStorage 位置。
+
+2026-10-06 直播聊天顶部的 SC 气泡列表单独开启 `horizontalMouseWheel`：普通鼠标滚轮的纵向输入在横向 delta 为零时映射为左右滚动，原生横向输入和 Shift 轴切换仍沿用原语义。该选项默认关闭，仅在 SC 气泡区域启用；减少动画模式仍可横向滚动，但立即更新位置。底部 3 逻辑像素的滚动条在内容溢出时常显，可用鼠标拖动；列表与滚动条共用独立控制器，由页面释放，关闭自动滚动条避免重复绘制。再次点击已展开的 SC 气泡收起详情，移除原来的关闭按钮。
+
+同方向连续输入累积尚未滚完的距离并衔接输入时刻的速度，重新定向官方模拟器；使用同一个帧时钟，不重新启动 Ticker 或直接改变当前显示位置。停止输入后由模拟器减速；反向输入丢弃旧方向的剩余距离和速度，下一帧开始朝新方向移动。每帧只消费模拟器的位置差并限制在列表边界内，允许布局独立修正当前位置；到边界立即丢弃余下动量。内容扩展时只有尚未到边界的滚动继续；内容缩短或视口变大导致当前位置超出新边界时，在下一动画帧夹紧位置并停止，不在布局中发送滚动更新。内层列表先处理滚轮，到达边界后允许外层接管；子控件已经认领的滚轮信号不交给平滑层。Shift 的轴切换及反向列表保持 Flutter 的原有语义。Ctrl/Alt/Meta 组合键、触摸拖动、trackpad 类型的滚轮信号和原生 PanZoom 手势沿用原有处理；不根据滚轮 delta 猜测设备。操作系统若将触控板报告成 mouse 类型信号，会按鼠标滚轮处理，真实设备表现仍需用户确认。
+
+刷新、回到顶部、滚动条拖动和手势操作通过 ScrollPosition 的活动生命周期取消原来的滚轮动量。工作区隐藏、TickerMode 禁用或系统请求减少动画时停止当前平滑过渡；恢复页面不继续旧动量。每个活动滚动区域只有一个本地 Ticker，使用 Scrollable 自身的 vsync，活动结束或页面关闭时释放。不添加全局逐帧状态，也不替换播放和网络会话。
+
+## 实现依据与限制
+
+Flutter 的默认 [pointerScroll](https://api.flutter.dev/flutter/widgets/ScrollPositionWithSingleContext/pointerScroll.html) 直接改变位置；只调整 ScrollPhysics 不能增加滚轮动画。实现利用 [ScrollBehavior](https://api.flutter.dev/flutter/widgets/ScrollBehavior-class.html) 装饰入口，在本列表的原生滚轮信号监听之前注册平滑处理，但保留后代命中目标和变换顺序，让 [PointerSignalResolver](https://api.flutter.dev/flutter/gestures/PointerSignalResolver-class.html) 正常仲裁子控件与嵌套滚动。使用公开的 render/hit-test 接口，不修改 SDK；这一接入位置按固定 SDK 验证，升级 Flutter 时须复测信号顺序。
+
+### 2026-10-17 官方模拟器
+
+当前实现使用官方 [ScrollSpringSimulation](https://api.flutter.dev/flutter/physics/ScrollSpringSimulation-class.html)，由 `SpringDescription.withDampingRatio` 固定 mass=1、stiffness=1600，阻尼比默认 1.3，对应 damping=104 的无回弹过阻尼。最初默认值 1 对应 damping=80 的临界阻尼。输入适配层只负责连续输入的剩余距离、速度衔接、边界和取消，删除自定义指数衰减与双速度解析积分；模拟器结束时精确返回终点。保留一个 Ticker，新增输入只更新模拟器与采样时间基准，8/16 毫秒连续输入不增加空帧。
+
+距离容差采用 `0.5 / devicePixelRatio` 逻辑像素，速度容差来自列表原有 `ScrollPhysics.toleranceFor`，避免为不足一个可见像素的尾部持续安排大量帧。模拟器自然收敛后一次结束，不另加取整或停止后的补位动画；终点仍保留逻辑小数，避免多次独立输入累积距离误差。异常输入先限幅，再将尚未滚完的距离限制为 1,500 逻辑像素，防止极大 delta 溢出或无限积累。
+
+新增回归先在旧实现上复现：单次 120 逻辑像素滚动经过 300 毫秒仍未释放滚动活动。官方模拟器版本在原阻尼比 1 下，DPR 1 / 1.25 / 1.5 / 2、8 / 16 毫秒帧间隔的八种组合均于 300 毫秒内结束；默认改为 1.3 后，对应回归验证八种组合均于 400 毫秒内结束。之后继续推进 100 毫秒和 1 秒，滚动位置及文字布局位置保持不变。另验证小数输入累计距离不漂移，以及内容缩短到不足一个视口时及时夹紧并释放活动。组件测试不经过真实 GPU 光栅化，不能证明 Windows 文字的物理像素观感或实际帧耗时；实际鼠标手感由用户确认。
+
+### 滚轮阻尼比设置（2026-10-17）
+
+“设置 → 外观 → 滚轮阻尼比”提供 0.50–2.00、步长 0.05 的滑块与“恢复默认阻尼比”按钮，默认 1.30。小于 1 为有回弹的欠阻尼，大于 1 为收尾较缓的过阻尼；这不是滚动距离或动画时长设置。释放滑块后，经原有设置控制器乐观更新并串行保存，失败时回退已保存值并显示原有错误提示。
+
+组合根在 Navigator 及弹窗上方放置共享 `SmoothScrollScope`，使普通列表和独立设置 `SmoothScrollBehavior` 的横向标签等区域都继承同一阻尼比。修改时停止旧动画、保留控制器和位置，后续输入立即使用新模拟器；不恢复旧动量，也不引入逐帧 Provider 更新。欠阻尼发生回弹时，下一次滚轮输入优先于反向速度或已越过的终点，避免新输入继续追赶旧回弹。
+
+不可变 `AppSettings.wheelDampingRatio` 经 `copyWith` 和规范化保留；有限值限制在 0.5–2，非有限值回退到 1.3。既有 `preferences.v1` JSON 快照从 schema 20 升至 21，缺失、空值或错误类型回退到 1.3，其余有效设置保留。2026-10-17 按用户要求将初始默认值及恢复默认值从 1 改为 1.3，已保存的有效值（包括 1.0）继续保留；未新增字段或改表，设置快照保持 schema 21，SQLite schema 仍为 3。
+
+定向回归共 119 项通过，覆盖默认值及边界、schema 20 兼容／schema 21 保存重载、连续保存与失败回退、设置滑块／重载／恢复默认、保留列表中的即时应用、横向局部覆盖继承、欠阻尼回弹接管，以及全部原有滚轮行为。日志为 `artifacts/wheel-damping-settings-targeted.log` 和 `artifacts/wheel-damping-scroll-targeted.log`。本轮不将组件测试当作物理鼠标手感或 GPU 性能结果。
+
+### 历史实现
+
+初版为每次输入调用 `animateTo`，使用 160 毫秒 `easeOutCubic`。新增行为测试在旧实现上复现：第二次输入立即改变速度；持续以 8 毫秒或 16 毫秒间隔输入时，下一帧位置与前一帧相同。原有测试仅验证最终位置，未发现这两种接续问题。
+
+2026-10-06 的早期版本由 Flutter 的 `ScrollSpringSimulation` 计算位置、速度及终止条件，采用 mass=1、stiffness=1024、damping=64 的临界阻尼弹簧。静止状态输入 120 逻辑像素时，数学响应约 210 毫秒到达 99%；用户反馈真实页面滚轮视觉上存在跳变，当时替换为以下速度驱动模型。
+
+2026-10-06 的速度驱动模型（2026-10-17 已替换）仅保存驱动速度 `u` 和显示速度 `v`，不保存目标位置：滚轮输入令 `u += delta / 0.075s`，同向输入保留 `v`；随后按 `du/dt = -u/0.075s`、`dv/dt = (u-v)/0.020s` 推进，位移为显示速度的积分。首次试用为 90 毫秒衰减和 25 毫秒跟随，用户确认方向正确，但感觉过于平滑；据此适度调整为 75 毫秒衰减和 20 毫秒跟随，缩短起步延迟和收尾拖行。它们均为本项目试验参数，不是官方客户端测量值。未触发限速/边界时总滚动距离保持不变。使用解析积分，8/16/32/96 毫秒帧间隔下相同时间的位移与速度一致，不以逐帧固定插值比例推进，也不反复建立动画或按位置误差补追。
+
+该历史模型未触发限速/边界时，单次输入的总积分位移等于滚轮 delta。驱动速度限制为 24,000 逻辑像素/秒，异常大 delta 和瞬时密集输入不会无限积累；显示速度也受该上限约束。剩余积分位移小于 0.01 逻辑像素且速度小于 5 逻辑像素/秒时，一次积分完不足 0.01 像素的尾部并释放活动，避免多次独立输入积累截断误差。ScrollPosition 正常发送开始/更新/结束通知，分页和 PageStorage 继续工作；替换滚动活动时框架负责释放旧 Ticker。
+
+PageView、文本输入区域等自行覆盖滚动装饰的控件，以及不实现 ScrollActivityDelegate 的自定义位置，保留其原有行为。Android/iOS 保留平台默认滚动。macOS/Linux 分支尚未在实际设备验证。
+
+此前使用 Computer Use 对本机官方哔哩哔哩与旧版 Bili Lite 做过短滚轮输入，但静态截图无法可靠量化逐帧平滑度，长滚动采样又混入用户操作。本项目参数不是测得的官方客户端参数，也不构成性能或等效手感结论。Widget 测试验证接续算法，无法排除真实列表图片解码、布局或绘制造成的掉帧；如仍卡顿，应使用 [Flutter profile 性能采样](https://docs.flutter.dev/perf/ui-performance) 分别检查 UI 和 raster 帧耗时。最终手感由用户在新版 Windows 窗口确认。
+
+## 2026-10-08 Windows 失焦后的修饰键与滚轮
+
+用户确认侧键和键盘快捷键恢复后，Alt+Tab → 在其他窗口释放 Alt → 鼠标切回仍会使滚轮变成即时跳动。原因是快捷键已经使用 InputNormalizer 的独立状态，而平滑层仍直接读取 HardwareKeyboard；缓存中残留的 Alt 令 `_onEvent` 提前返回，Flutter Scrollable 随后按 `pointerScroll` 立即更新位置。新增宿主回归在修复前复现单次 120 像素滚轮事件直接把位置从 0 改为 120。
+
+平滑层现在通过 [InputModifierScope](../../lib/core/presentation/input_scope.dart)读取输入宿主共享的状态，Ctrl／Alt／Meta 组合判断和 Shift 轴切换均不再旁路读取 Windows 缓存。[图片查看器](../../lib/shared/ui/image_viewer.dart)的 Ctrl+滚轮沿用同一入口；宿主缺失的独立组件与其他平台继续使用 Flutter 状态。修饰键按物理身份保存逻辑键和掩码，保留左右键同时按下／分别释放的语义。Windows 临时跟踪仍由 AppInputHost 原有 TODO 约束；没有改变滚动积分、衰减／跟随参数、信号仲裁、控制器或减少动画设置。
+
+[滚轮回归](../../test/shared/ui/smooth_scroll_behavior_test.dart)覆盖 Alt／Ctrl／Meta 缓存残留后的鼠标点击恢复、逐帧中间位置、真正重新按下修饰键仍使用即时处理、残留 Shift 不错误换轴，以及左右 Shift 分别释放时仍能横向平滑滚动。[图片回归](../../test/features/image_viewer/image_viewer_test.dart)比较普通滚轮与残留 Ctrl 后的缩放行为，并验证真正的右 Ctrl 组合仍生效。测试模拟焦点切换并保留 Flutter 缓存，不代表真实 Windows Alt+Tab／键鼠手感验收。
+
+完整检查 `tool/check.ps1 -SkipPub` 通过：根应用 1,397、bili_api 325、bili_player 32、bili_danmaku 65 项，共 1,819 项；根应用和三个包的格式及静态分析通过。六项新增滚轮／图片回归包含在根应用检查中。日志为 `build/input-investigation/wheel-modifier-check.log`。按用户要求以回归检查交付，真实 Windows 体验由用户自行构建实测。
+
+## 验证
+
+- 2026-10-17 默认阻尼比调整为 1.30：111 项定向回归及 `tool/check.ps1 -SkipPub` 完整通过（2,555 项通过，10 项原生用例因未配置 `BILI_MUX_LIBRARY` 跳过）。覆盖缺失／异常回退、显式保存 1.0 等有效值的保留、恢复默认、默认模拟器收尾与停止后位置稳定。日志 `artifacts/wheel-damping-default-targeted.log`、`artifacts/wheel-damping-default-check.log`；未构建或更新已安装应用。
+- 2026-10-17 阻尼比设置：`tool/check.ps1 -SkipPub` 完整通过，根应用 1,962、bili_api 426、bili_player 72、bili_danmaku 93、bili_mux 2 项，共 2,555 项测试；`bili_mux` 的 10 项原生用例因未配置 `BILI_MUX_LIBRARY` 跳过。根应用和四个包的格式／静态分析及打包边界检查通过，日志 `artifacts/wheel-damping-settings-check.log`。改动文档的 116 个本地链接存在，`git diff --check` 通过。本轮未构建或更新已安装应用，实际滚轮手感由用户重新构建后确认；Android/macOS 实机与 GPU 帧耗时未测。
+- 2026-10-17 官方模拟器改版：共享滚轮 44 项定向回归通过。`tool/check.ps1 -SkipPub` 完整通过：根应用 1,955、bili_api 426、bili_player 72、bili_danmaku 93、bili_mux 2 项，共 2,548 项测试；`bili_mux` 另有 10 项原生用例因未配置 `BILI_MUX_LIBRARY` 跳过。根应用与四个包的格式／静态分析通过，打包边界脚本通过。日志 `artifacts/official-scroll-simulation-check.log`，文档本地链接与 `git diff --check` 通过。本轮未构建或更新已安装应用，Windows 实际手感与文字光栅化表现由用户重新构建后确认，Android/macOS 实机及性能帧耗时未测。
+- 2026-10-06 参数微调：用户试用确认 90ms/25ms 的速度驱动滚动方向正确，但认为过于平滑；衰减调为 75ms、跟随调为 20ms，积分模型与未限速/未到边界时的总距离不变。29 项共享滚动及共 92 项定向回归通过，日志 `artifacts/velocity-scroll-tuning-targeted.log`。`tool/check.ps1 -SkipPub` 的根格式/分析通过，根测试仍为 688/700 通过、同样的 12 项已有失败，与前轮失败名称对比没有新增；三个包独立格式/分析及 227/16/21 项测试全部通过。日志 `artifacts/velocity-scroll-tuning-check.log`、`artifacts/velocity-scroll-tuning-packages.log`。新参数的实际手感待用户再次确认。
+- 参数微调后的 Windows Release 构建通过，日志 `artifacts/velocity-scroll-tuning-windows-build.log`；已正常关闭上轮预览进程并启动 `build/windows/x64/runner/Release/bilisail.exe` 供比较，未更新 MSIX 安装。仅修改 Dart 滚轮参数，没有原生播放改动；Android/macOS 实机及帧耗时未测。
+- 2026-10-06 速度驱动改版：共享滚动 29 项测试和共享分页/首页/直播页面共 92 项定向回归通过。新增独立输入累计位移、速度渐增/自然衰减、反向逐帧不残留正向运动、8/16/32/96ms 积分一致、异常大输入与速度上限、内容扩展保留动量、边界丢弃动量（含 BouncingScrollPhysics）；日志 `artifacts/velocity-scroll-targeted.log`。真实鼠标手感和 UI/raster 帧耗时尚未验收。
+- 本轮 `tool/check.ps1 -SkipPub`：根应用格式/静态分析通过，700 项测试中 688 通过、12 失败。将共享滚动临时恢复为原 position-target spring 并保留其他现有修改，三份失败测试文件重跑后同样复现全部 12 项失败：工作区编辑框 Ctrl+W 旧预期、播放器测试缺少 AppNoticeHost、视频/合集测试缺少 AuthRepository 注入。未修改这些已有代码或测试；日志 `artifacts/velocity-scroll-check.log` 和 `artifacts/velocity-scroll-baseline.log`。检查脚本因根测试失败未继续子包，因此独立完成三个包的格式、分析和测试：bili_api 227、bili_player 16、bili_danmaku 21，全部通过；日志 `artifacts/velocity-scroll-packages.log`。
+- 本轮 `flutter build windows --release --no-pub` 通过，输出 `build/windows/x64/runner/Release/bilisail.exe`，日志 `artifacts/velocity-scroll-windows-build.log`。已启动该构建供用户比较滚轮手感；未更新现有 MSIX 安装。构建/启动成功不等于真实鼠标操作验收或帧耗时采样，Android/macOS 实机仍未测。
+- 2026-10-06 SC 交互修正：旧实现的普通鼠标滚轮测试复现横向位置停在 0；修正后直播页面与共享滚动的 33 项定向测试通过，覆盖正反向滚轮、原生横向输入、末尾气泡展开／再次点击收起、底部拖动条、减少动画及侧栏隐藏后位置／播放器保留。`tool/check.ps1 -SkipPub` 完整通过：根应用 599、bili_api 206、bili_player 16、bili_danmaku 19，共 840 项测试，四处格式与静态分析通过；日志 `artifacts/sc-scroll-check.log`。Windows Release 构建通过，输出 `build/windows/x64/runner/Release/bilisail.exe`，日志 `artifacts/sc-scroll-windows-build.log`。该轮未进行真实直播窗口的鼠标操作验收，Android/macOS 实机未测。
+- 22 项定向 Widget 回归通过：保留初版全部覆盖，新增速度连续、8ms/16ms 连续输入无停帧、活动中减少动画/TickerMode 禁用、trackpad 接管、内容缩短、回顶部动画接管和移除滚动装饰的生命周期验证；触摸拖动在活动中的滚轮动画上验证。
+- 2026-10-06 `tool/check.ps1 -SkipPub` 通过：根应用 597、bili_api 206、bili_player 16、bili_danmaku 19 项测试，共 838 项；四处格式检查和静态分析通过。
+- 2026-10-06 `flutter build windows --release --no-pub` 通过，输出 `build/windows/x64/runner/Release/bilisail.exe`；已启动此构建供用户确认鼠标手感。仅构建/启动和 Widget 行为验证，不将其计为真实设备帧耗时采样。
+- Windows 鼠标实际手感由用户验收；Android/macOS/Linux 的实际设备体验未测。没有修改原生播放实现。

@@ -1,0 +1,17 @@
+name: bili_danmaku
+description: Bounded danmaku clocks and canvas_danmaku rendering for BiliSail.
+version: 0.1.0
+publish_to: none
+environment:
+  sdk: '>=3.13.0 <4.0.0'
+dependencies:
+  flutter:
+    sdk: flutter
+  canvas_danmaku:
+    git:
+      url: https://github.com/bggRGjQaUbCoE/canvas_danmaku.git
+      ref: 275046d8647a6a26cba1d0dadb9e28688cb3dbf1
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: 6.0.0

@@ -1,0 +1,593 @@
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+
+import '../../../domain/app_failure.dart';
+import '../../../domain/comment_target.dart';
+import '../../../domain/request_cancellation.dart';
+import '../../../domain/user.dart';
+import '../../auth/application/auth_controller.dart';
+import '../domain/comments_repository.dart';
+import '../domain/comment_composer.dart';
+
+final videoCommentsRepositoryProvider = Provider<CommentsRepository>(
+  (ref) => throw UnimplementedError('CommentsRepository'),
+);
+final commentImagePickerProvider =
+    Provider<Future<List<CommentLocalImage>> Function(int)>(
+      (ref) => throw UnimplementedError('Comment image picker'),
+    );
+final commentsRepositoryProvider =
+    Provider.family<CommentsRepository, CommentTargetType>(
+      (ref, type) => type == CommentTargetType.video
+          ? ref.watch(videoCommentsRepositoryProvider)
+          : throw UnimplementedError('CommentsRepository for ${type.name}'),
+    );
+final commentsControllerProvider = NotifierProvider.autoDispose
+    .family<CommentsController, CommentsState, CommentTarget>(
+      (target) => CommentsController(target.oid, type: target.type),
+    );
+
+final videoCommentsControllerProvider = NotifierProvider.autoDispose
+    .family<CommentsController, CommentsState, String>(CommentsController.new);
+
+NotifierProvider<CommentsController, CommentsState> commentsProviderFor(
+  CommentTarget target,
+) => target.type == CommentTargetType.video
+    ? videoCommentsControllerProvider(target.oid)
+    : commentsControllerProvider(target);
+
+final class CommentsState {
+  const CommentsState({
+    this.emotePackages = const [],
+    this.emotesLoading = false,
+    this.emotesMessage,
+    this.items = const [],
+    this.sort = CommentSort.hot,
+    this.page = 0,
+    this.nextCursor,
+    this.totalCount,
+    this.hasMore = true,
+    this.loading = false,
+    this.loadFailed = false,
+    this.signedIn = false,
+    this.accountScope = 'guest',
+    this.sessionEpoch = 0,
+    this.busy = false,
+    this.message,
+    this.openRoot,
+    this.replyItems = const [],
+    this.replyPage = 0,
+    this.replyHasMore = false,
+    this.replyLoading = false,
+    this.replyLoadFailed = false,
+    this.replyTarget,
+    this.uncertain = const {},
+  });
+  final String accountScope;
+  final int sessionEpoch;
+  final List<CommentEmotePackage> emotePackages;
+  final bool emotesLoading;
+  final String? emotesMessage;
+  final List<CommentEntry> items, replyItems;
+  final CommentSort sort;
+  final int page, replyPage;
+  final String? nextCursor;
+  final int? totalCount;
+  final bool hasMore, loading, signedIn, busy, replyHasMore, replyLoading;
+  final bool loadFailed, replyLoadFailed;
+  final String? message;
+  final CommentEntry? openRoot, replyTarget;
+  final Set<String> uncertain;
+  CommentsState copy({
+    List<CommentEmotePackage>? emotePackages,
+    bool? emotesLoading,
+    String? emotesMessage,
+    List<CommentEntry>? items,
+    CommentSort? sort,
+    int? page,
+    String? nextCursor,
+    bool clearCursor = false,
+    int? totalCount,
+    bool? hasMore,
+    bool? loading,
+    bool? loadFailed,
+    bool? busy,
+    String? message,
+    CommentEntry? openRoot,
+    bool closeRoot = false,
+    List<CommentEntry>? replyItems,
+    int? replyPage,
+    bool? replyHasMore,
+    bool? replyLoading,
+    bool? replyLoadFailed,
+    CommentEntry? replyTarget,
+    bool clearTarget = false,
+    Set<String>? uncertain,
+  }) => CommentsState(
+    emotePackages: emotePackages ?? this.emotePackages,
+    emotesLoading: emotesLoading ?? this.emotesLoading,
+    emotesMessage: emotesMessage,
+    items: items ?? this.items,
+    sort: sort ?? this.sort,
+    page: page ?? this.page,
+    nextCursor: clearCursor ? null : nextCursor ?? this.nextCursor,
+    totalCount: totalCount ?? this.totalCount,
+    hasMore: hasMore ?? this.hasMore,
+    loading: loading ?? this.loading,
+    loadFailed: loadFailed ?? this.loadFailed,
+    signedIn: signedIn,
+    accountScope: accountScope,
+    sessionEpoch: sessionEpoch,
+    busy: busy ?? this.busy,
+    message: message,
+    openRoot: closeRoot ? null : openRoot ?? this.openRoot,
+    replyItems: replyItems ?? this.replyItems,
+    replyPage: replyPage ?? this.replyPage,
+    replyHasMore: replyHasMore ?? this.replyHasMore,
+    replyLoading: replyLoading ?? this.replyLoading,
+    replyLoadFailed: replyLoadFailed ?? this.replyLoadFailed,
+    replyTarget: clearTarget ? null : replyTarget ?? this.replyTarget,
+    uncertain: uncertain ?? this.uncertain,
+  );
+}
+
+class CommentsController extends Notifier<CommentsState> {
+  CommentsController(
+    this.oid, {
+    this.type = CommentTargetType.video,
+    this.initialReply,
+    this.loadInitially = true,
+  });
+  final CommentEntry? initialReply;
+  final bool loadInitially;
+  bool _initialReplyUsed = false;
+  final CommentTargetType type;
+  CommentsRepository get _repository =>
+      ref.read(commentsRepositoryProvider(type));
+  final String oid;
+  RequestCancellation _read = RequestCancellation(),
+      _replies = RequestCancellation(),
+      _write = RequestCancellation();
+  RequestCancellation _emotes = RequestCancellation();
+  int _emoteGeneration = 0;
+  int _generation = 0, _replyGeneration = 0;
+  @override
+  CommentsState build() {
+    final auth = ref.watch(authControllerProvider);
+    _cancel();
+    final generation = ++_generation;
+    ++_replyGeneration;
+    ref.onDispose(() {
+      ++_generation;
+      ++_replyGeneration;
+      _cancel();
+    });
+    if (loadInitially) {
+      Future<void>.microtask(() {
+        if (ref.mounted && generation == _generation) return load();
+      });
+    }
+    final reply = _initialReplyUsed ? null : initialReply;
+    _initialReplyUsed = true;
+    return CommentsState(
+      signedIn: auth.isSignedIn,
+      accountScope: _repository.accountScope,
+      sessionEpoch: _repository.sessionEpoch,
+      replyTarget: reply,
+    );
+  }
+
+  void _cancel() {
+    _read.cancel();
+    _replies.cancel();
+    _write.cancel();
+    _emotes.cancel();
+    ++_emoteGeneration;
+  }
+
+  bool _current(int generation, String scope, int epoch) {
+    if (!ref.mounted || generation != _generation) return false;
+    final r = _repository;
+    return r.accountScope == scope && r.sessionEpoch == epoch;
+  }
+
+  bool isCurrentAccount(String scope, int epoch) =>
+      ref.mounted &&
+      _repository.accountScope == scope &&
+      _repository.sessionEpoch == epoch;
+
+  static List<CommentEntry> _merge(
+    List<CommentEntry> old,
+    List<CommentEntry> next,
+  ) => List.unmodifiable(
+    {
+      for (final c in [...old, ...next]) c.id: c,
+    }.values.take(500),
+  );
+
+  static CommentEntry _updateEntry(
+    CommentEntry entry,
+    String id,
+    CommentEntry Function(CommentEntry) update,
+  ) {
+    if (entry.id == id) return update(entry);
+    final replies = _updateEntries(entry.replies, id, update);
+    return identical(replies, entry.replies)
+        ? entry
+        : entry.withReplies(replies);
+  }
+
+  // Preserve unchanged branches so mounted rows can reuse their content.
+  static List<CommentEntry> _updateEntries(
+    List<CommentEntry> entries,
+    String id,
+    CommentEntry Function(CommentEntry) update,
+  ) {
+    List<CommentEntry>? changed;
+    for (var index = 0; index < entries.length; index++) {
+      final entry = entries[index];
+      final next = _updateEntry(entry, id, update);
+      if (!identical(entry, next)) {
+        changed ??= List.of(entries);
+        changed[index] = next;
+      }
+    }
+    return changed == null ? entries : List.unmodifiable(changed);
+  }
+
+  static String? _error(Object e) => e is AppFailure
+      ? e.kind == AppFailureKind.cancelled
+            ? null
+            : e.message
+      : '评论加载失败，请稍后重试';
+  Future<void> load({CommentSort? sort, bool refresh = false}) async {
+    if (!ref.mounted || state.busy) return;
+    final reset = refresh || sort != null;
+    if (!reset &&
+        (state.loading || !state.hasMore || state.items.length >= 500)) {
+      return;
+    }
+    if (reset) {
+      _replies.cancel();
+      ++_replyGeneration;
+    }
+    _read.cancel();
+    _read = RequestCancellation();
+    final generation = ++_generation;
+    final r = _repository, selected = sort ?? state.sort;
+    final scope = r.accountScope, epoch = r.sessionEpoch;
+    final page = reset ? 1 : state.page + 1;
+    state = state.copy(
+      sort: selected,
+      loading: true,
+      loadFailed: false,
+      items: reset ? [] : null,
+      page: reset ? 0 : null,
+      clearCursor: reset,
+      closeRoot: reset,
+      clearTarget: reset,
+      replyItems: reset ? const [] : null,
+      replyPage: reset ? 0 : null,
+      replyHasMore: reset ? false : null,
+      replyLoading: reset ? false : null,
+      replyLoadFailed: reset ? false : null,
+    );
+    try {
+      final p = await r.load(
+        oid,
+        page,
+        selected,
+        _read,
+        cursor: reset ? null : state.nextCursor,
+      );
+      if (!_current(generation, scope, epoch)) return;
+      final previousCount = reset ? 0 : state.items.length;
+      final items = _merge(reset ? [] : state.items, p.items);
+      state = state.copy(
+        items: items,
+        page: page,
+        nextCursor: p.nextCursor,
+        clearCursor: p.nextCursor == null,
+        totalCount: p.totalCount,
+        hasMore:
+            p.hasMore && items.length > previousCount && items.length < 500,
+        loading: false,
+        uncertain: Set.unmodifiable(
+          state.uncertain.where(
+            (v) => !p.items.any((c) => v == 'like:${c.id}'),
+          ),
+        ),
+      );
+    } catch (e) {
+      if (_current(generation, scope, epoch)) {
+        state = state.copy(
+          loading: false,
+          loadFailed: true,
+          message: _error(e),
+        );
+      }
+    }
+  }
+
+  Future<void> openReplies(CommentEntry root) async {
+    if (state.busy) return;
+    _replies.cancel();
+    ++_replyGeneration;
+    state = state.copy(
+      openRoot: root,
+      replyItems: [],
+      replyPage: 0,
+      replyHasMore: true,
+      replyLoading: false,
+      replyLoadFailed: false,
+      clearTarget: true,
+    );
+    await loadReplies();
+  }
+
+  void closeReplies() {
+    _replies.cancel();
+    ++_replyGeneration;
+    state = state.copy(
+      closeRoot: true,
+      clearTarget: true,
+      replyItems: const [],
+      replyPage: 0,
+      replyHasMore: false,
+      replyLoading: false,
+      replyLoadFailed: false,
+    );
+  }
+
+  Future<void> loadReplies() async {
+    final root = state.openRoot;
+    if (root == null ||
+        state.replyLoading ||
+        !state.replyHasMore ||
+        state.busy) {
+      return;
+    }
+    _replies = RequestCancellation();
+    final generation = _generation, replyGeneration = ++_replyGeneration;
+    final r = _repository, scope = r.accountScope, epoch = r.sessionEpoch;
+    final page = state.replyPage + 1;
+    state = state.copy(replyLoading: true, replyLoadFailed: false);
+    try {
+      final p = await r.replies(oid, root.id, page, _replies);
+      if (!_current(generation, scope, epoch) ||
+          replyGeneration != _replyGeneration) {
+        return;
+      }
+      final items = _merge(state.replyItems, p.items);
+      state = state.copy(
+        replyItems: items,
+        replyPage: page,
+        replyHasMore:
+            p.hasMore &&
+            items.length > state.replyItems.length &&
+            items.length < 500,
+        replyLoading: false,
+        uncertain: Set.unmodifiable(
+          state.uncertain.where(
+            (v) => !p.items.any((c) => v == 'like:${c.id}'),
+          ),
+        ),
+      );
+    } catch (e) {
+      if (_current(generation, scope, epoch) &&
+          replyGeneration == _replyGeneration) {
+        state = state.copy(
+          replyLoading: false,
+          replyLoadFailed: true,
+          message: _error(e),
+        );
+      }
+    }
+  }
+
+  Future<void> loadEmotes() async {
+    if (state.emotesLoading || state.emotePackages.isNotEmpty) return;
+    final r = _repository;
+    if (r is! CommentEmotesRepository) {
+      state = state.copy(emotesMessage: '表情服务暂不可用');
+      return;
+    }
+    final scope = r.accountScope,
+        epoch = r.sessionEpoch,
+        generation = ++_emoteGeneration;
+    _emotes.cancel();
+    _emotes = RequestCancellation();
+    state = state.copy(emotesLoading: true);
+    bool current() =>
+        ref.mounted &&
+        generation == _emoteGeneration &&
+        r.accountScope == scope &&
+        r.sessionEpoch == epoch;
+    try {
+      final packages = await (r as CommentEmotesRepository).emotes(_emotes);
+      if (current()) {
+        state = state.copy(
+          emotePackages: packages,
+          emotesLoading: false,
+          emotesMessage: packages.isEmpty ? '暂无可用表情' : null,
+        );
+      }
+    } catch (e) {
+      if (current()) {
+        state = state.copy(emotesLoading: false, emotesMessage: _error(e));
+      }
+    }
+  }
+
+  void target(CommentEntry entry) => state = state.copy(replyTarget: entry);
+  void cancelTarget() => state = state.copy(clearTarget: true);
+  void acknowledgeSend() => state = state.copy(
+    uncertain: Set.unmodifiable(state.uncertain.where((v) => v != 'send')),
+  );
+  Future<bool> _perform(
+    String key,
+    Future<void> Function(CommentsRepository) operation,
+  ) async {
+    if (!state.signedIn ||
+        state.busy ||
+        state.loading ||
+        state.replyLoading ||
+        state.uncertain.contains(key)) {
+      return false;
+    }
+    final r = _repository,
+        scope = r.accountScope,
+        epoch = r.sessionEpoch,
+        generation = _generation;
+    _write = RequestCancellation();
+    state = state.copy(busy: true);
+    try {
+      await operation(r);
+      if (!_current(generation, scope, epoch)) return false;
+      state = state.copy(busy: false);
+      return true;
+    } catch (e) {
+      if (!_current(generation, scope, epoch)) return false;
+      state = state.copy(
+        busy: false,
+        message: e is CommentWriteUncertain
+            ? '结果暂时无法确认，请核对评论后再操作，未自动重试。'
+            : _error(e),
+        uncertain: e is CommentWriteUncertain
+            ? Set.unmodifiable({...state.uncertain, key})
+            : null,
+      );
+      return false;
+    }
+  }
+
+  Future<bool> toggleLike(CommentEntry comment) async {
+    final liked = !comment.liked;
+    final result = await _perform(
+      'like:${comment.id}',
+      (r) => r.like(oid, comment.id, liked, _write),
+    );
+    if (!result) return false;
+    CommentEntry update(CommentEntry c) => c.withLike(liked);
+    state = state.copy(
+      items: _updateEntries(state.items, comment.id, update),
+      replyItems: _updateEntries(state.replyItems, comment.id, update),
+      openRoot: state.openRoot == null
+          ? null
+          : _updateEntry(state.openRoot!, comment.id, update),
+    );
+    return true;
+  }
+
+  Future<List<CommentMention>> searchMentions(
+    String keyword,
+    RequestCancellation cancellation,
+  ) async {
+    final r = _repository;
+    if (!state.signedIn || r is! CommentComposerRepository) return const [];
+    final scope = r.accountScope,
+        epoch = r.sessionEpoch,
+        generation = _generation;
+    final users = await (r as CommentComposerRepository).searchMentions(
+      keyword,
+      cancellation,
+    );
+    return _current(generation, scope, epoch) && !cancellation.isCancelled
+        ? users
+        : const [];
+  }
+
+  Future<bool> send(
+    String message, {
+    List<CommentLocalImage> images = const [],
+    Map<String, UserId> mentions = const {},
+    bool syncToDynamic = false,
+  }) async {
+    final text = message.trim();
+    if ((text.isEmpty && images.isEmpty) ||
+        text.runes.length > 1000 ||
+        images.length > CommentLocalImage.maxCount ||
+        images.any(
+          (i) => i.bytes.isEmpty || i.bytes.length > CommentLocalImage.maxBytes,
+        )) {
+      return false;
+    }
+    final target = state.replyTarget;
+    final rootId =
+        state.openRoot?.id ??
+        (target == null ? null : target.rootId ?? target.id);
+    final parentId = target?.id ?? rootId;
+    if (images.isNotEmpty && rootId != null) {
+      state = state.copy(message: '图片仅支持主评论，请取消回复后发布');
+      return false;
+    }
+    CommentEntry? sent;
+    final ok = await _perform('send', (r) async {
+      final cancellation = _write;
+      final scope = r.accountScope, epoch = r.sessionEpoch;
+      final pictures = <CommentPicture>[];
+      if (images.isNotEmpty) {
+        if (r is! CommentComposerRepository) {
+          throw const AppFailure(AppFailureKind.protocol, '当前无法上传评论图片');
+        }
+        for (final image in images) {
+          if (cancellation.isCancelled) return;
+          pictures.add(
+            await (r as CommentComposerRepository).uploadPicture(
+              image,
+              cancellation,
+            ),
+          );
+        }
+      }
+      if (cancellation.isCancelled || !isCurrentAccount(scope, epoch)) return;
+      sent = await r.send(
+        oid,
+        text,
+        rootId: rootId,
+        parentId: parentId,
+        pictures: pictures,
+        mentions: Map.unmodifiable({
+          for (final entry in mentions.entries)
+            if (text.contains('@${entry.key} ') ||
+                text.endsWith('@${entry.key}'))
+              entry.key: entry.value,
+        }),
+        syncToDynamic: syncToDynamic,
+        cancellation: cancellation,
+      );
+    });
+    final entry = sent;
+    if (!ok || entry == null) return false;
+    final label = rootId == null ? '评论' : '回复';
+    final serverMessage = entry.submissionMessage?.trim();
+    final notice = entry.visibility == CommentVisibility.restricted
+        ? '$label已提交，暂未公开，请稍后查看'
+        : serverMessage != null && serverMessage.isNotEmpty
+        ? serverMessage
+        : entry.visibility == CommentVisibility.normal
+        ? '$label已发送'
+        : '$label已提交，请刷新确认显示状态';
+    if (rootId == null) {
+      state = state.copy(
+        items: _merge([entry], state.items),
+        totalCount: (state.totalCount ?? state.items.length) + 1,
+        clearTarget: true,
+        message: notice,
+      );
+    } else {
+      CommentEntry update(CommentEntry c) => c.id == rootId
+          ? c.withReplies(_merge(c.replies, [entry]), count: c.replyCount + 1)
+          : c;
+      state = state.copy(
+        items: state.items.map(update).toList(),
+        openRoot: state.openRoot == null ? null : update(state.openRoot!),
+        replyItems: state.openRoot?.id == rootId
+            ? _merge(state.replyItems, [entry])
+            : null,
+        clearTarget: true,
+        message: notice,
+      );
+    }
+    return true;
+  }
+}

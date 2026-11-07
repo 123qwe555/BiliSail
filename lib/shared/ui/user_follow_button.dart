@@ -1,0 +1,344 @@
+import 'dart:async';
+
+import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+
+import 'app_dialog.dart';
+import '../../domain/user.dart';
+import '../../features/video/application/video_author_controller.dart';
+import '../../features/video/domain/video_author_repository.dart';
+
+/// Shares follow writes and their uncertainty handling across user surfaces.
+final class UserFollowButton extends ConsumerWidget {
+  const UserFollowButton({
+    super.key,
+    required this.id,
+    this.onLogin,
+    this.compact = false,
+    this.showMessage = true,
+    this.iconOnly = false,
+  });
+
+  final UserId id;
+  final VoidCallback? onLogin;
+  final bool compact, showMessage, iconOnly;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    if (!id.isValid) return const SizedBox.shrink();
+    final mid = id.value;
+    final provider = videoAuthorControllerProvider(VideoAuthorId(mid));
+    final state = ref.watch(provider);
+    if (state.isSelf) return const SizedBox.shrink();
+    final author = state.author;
+    final theme = Theme.of(context);
+    final following = author?.following == true;
+    final needsRefresh =
+        state.uncertain || (author == null && state.message != null);
+    final Widget button;
+    if (following && state.signedIn && !needsRefresh) {
+      final enabled =
+          !state.busy &&
+          !state.loading &&
+          !state.groupsLoading &&
+          !state.groupsBusy;
+      void onSelected(String action) {
+        final controller = ref.read(provider.notifier);
+        if (action == 'groups') {
+          unawaited(controller.loadGroups());
+          unawaited(
+            showAppDialog<void>(
+              context: context,
+              builder: (_) => _FollowGroupsDialog(id: VideoAuthorId(mid)),
+            ),
+          );
+        } else if (action == 'unfollow') {
+          unawaited(controller.toggleFollow());
+        }
+      }
+
+      const menuItems = [
+        PopupMenuItem(value: 'groups', child: Text('设置分组')),
+        PopupMenuItem(value: 'unfollow', child: Text('取消关注')),
+      ];
+      button = iconOnly
+          ? PopupMenuButton<String>(
+              tooltip: '关注操作',
+              enabled: enabled,
+              position: PopupMenuPosition.under,
+              onSelected: onSelected,
+              itemBuilder: (_) => menuItems,
+              child: _avatarIcon(context, state, Icons.check),
+            )
+          : Builder(
+              builder: (context) => Tooltip(
+                message: '关注操作',
+                child: OutlinedButton.icon(
+                  style: OutlinedButton.styleFrom(
+                    minimumSize: Size(80, compact ? 32 : 40),
+                    padding: EdgeInsets.symmetric(
+                      horizontal: compact ? 10 : 12,
+                      vertical: compact ? 6 : 8,
+                    ),
+                    tapTargetSize: compact
+                        ? MaterialTapTargetSize.shrinkWrap
+                        : MaterialTapTargetSize.padded,
+                  ),
+                  onPressed: enabled
+                      ? () async {
+                          final button =
+                              context.findRenderObject() as RenderBox;
+                          final overlay =
+                              Overlay.of(context).context.findRenderObject()
+                                  as RenderBox;
+                          final origin = button.localToGlobal(
+                            Offset(0, button.size.height),
+                            ancestor: overlay,
+                          );
+                          final action = await showMenu<String>(
+                            context: context,
+                            position: RelativeRect.fromRect(
+                              origin & Size(button.size.width, 0),
+                              Offset.zero & overlay.size,
+                            ),
+                            items: menuItems,
+                          );
+                          if (action != null && context.mounted) {
+                            onSelected(action);
+                          }
+                        }
+                      : null,
+                  icon: state.busy
+                      ? const SizedBox.square(
+                          dimension: 14,
+                          child: CircularProgressIndicator(strokeWidth: 1.5),
+                        )
+                      : const Icon(Icons.expand_more, size: 18),
+                  label: Text(state.busy ? '处理中' : '已关注'),
+                ),
+              ),
+            );
+    } else {
+      final onPressed = state.busy || state.loading
+          ? null
+          : !state.signedIn
+          ? onLogin
+          : () {
+              final controller = ref.read(provider.notifier);
+              if (needsRefresh) {
+                controller.refresh();
+              } else {
+                controller.toggleFollow();
+              }
+            };
+      final icon = needsRefresh
+          ? Icons.refresh
+          : following
+          ? Icons.check
+          : Icons.add;
+      button = iconOnly
+          ? IconButton(
+              tooltip: state.message ?? (needsRefresh ? '刷新关注状态' : '关注'),
+              onPressed: onPressed,
+              style: IconButton.styleFrom(
+                minimumSize: const Size.square(28),
+                padding: EdgeInsets.zero,
+                tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+              ),
+              icon: ExcludeSemantics(child: _avatarIcon(context, state, icon)),
+            )
+          : TextButton.icon(
+              style: TextButton.styleFrom(
+                foregroundColor: following || needsRefresh
+                    ? theme.colorScheme.onSurfaceVariant
+                    : theme.colorScheme.primary,
+                backgroundColor: following || needsRefresh
+                    ? theme.colorScheme.surfaceContainerHigh
+                    : theme.colorScheme.primaryContainer,
+                minimumSize: Size(80, compact ? 32 : 40),
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 10,
+                  vertical: 6,
+                ),
+                tapTargetSize: compact
+                    ? MaterialTapTargetSize.shrinkWrap
+                    : MaterialTapTargetSize.padded,
+              ),
+              onPressed: onPressed,
+              icon: state.busy || state.loading
+                  ? SizedBox.square(
+                      dimension: 13,
+                      child: CircularProgressIndicator(
+                        strokeWidth: 1.5,
+                        color: theme.colorScheme.onSurfaceVariant,
+                      ),
+                    )
+                  : Icon(icon, size: 15),
+              label: Text(
+                state.busy
+                    ? '处理中'
+                    : needsRefresh
+                    ? '刷新状态'
+                    : following
+                    ? '已关注'
+                    : '关注',
+              ),
+            );
+    }
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        button,
+        if (showMessage && state.message != null)
+          ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 320),
+            child: Padding(
+              padding: const EdgeInsets.only(top: 6),
+              child: Text(
+                state.message ?? '',
+                style: theme.textTheme.bodySmall,
+              ),
+            ),
+          ),
+      ],
+    );
+  }
+
+  Widget _avatarIcon(
+    BuildContext context,
+    VideoAuthorState state,
+    IconData icon,
+  ) {
+    final colors = Theme.of(context).colorScheme;
+    final muted = state.author?.following == true || state.uncertain;
+    return Semantics(
+      button: true,
+      label: state.busy || state.loading
+          ? '加载关注状态'
+          : muted
+          ? '关注操作'
+          : '关注',
+      child: SizedBox.square(
+        dimension: 28,
+        child: Center(
+          child: Container(
+            width: 22,
+            height: 22,
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              color: muted ? colors.surfaceContainerHighest : colors.primary,
+              border: Border.all(color: colors.surface, width: 1.5),
+            ),
+            child: state.busy || state.loading
+                ? Padding(
+                    padding: const EdgeInsets.all(4),
+                    child: CircularProgressIndicator(
+                      strokeWidth: 1.5,
+                      color: muted ? colors.onSurfaceVariant : colors.onPrimary,
+                    ),
+                  )
+                : Icon(
+                    icon,
+                    size: 14,
+                    color: muted ? colors.onSurfaceVariant : colors.onPrimary,
+                  ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+final class _FollowGroupsDialog extends ConsumerWidget {
+  const _FollowGroupsDialog({required this.id});
+
+  final VideoAuthorId id;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final provider = videoAuthorControllerProvider(id);
+    final state = ref.watch(provider);
+    final controller = ref.read(provider.notifier);
+    final groups = state.groups;
+    return AlertDialog(
+      title: const Text('设置分组'),
+      scrollable: true,
+      content: SizedBox(
+        width: 320,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            if (state.groupsLoading)
+              const Center(child: CircularProgressIndicator())
+            else if (groups == null)
+              const Text('分组加载失败，请重试')
+            else if (groups.isEmpty)
+              const Text('暂无可设置的分组')
+            else
+              ConstrainedBox(
+                constraints: const BoxConstraints(maxHeight: 320),
+                child: SingleChildScrollView(
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      for (final group in groups)
+                        CheckboxListTile(
+                          dense: true,
+                          contentPadding: EdgeInsets.zero,
+                          title: Text(group.name),
+                          value: state.selectedGroupIds.contains(group.id),
+                          onChanged: state.groupsBusy || state.groupsUncertain
+                              ? null
+                              : (selected) => controller.selectGroup(
+                                  group.id,
+                                  selected == true,
+                                ),
+                        ),
+                    ],
+                  ),
+                ),
+              ),
+            if (state.groupsMessage case final String message)
+              Padding(
+                padding: const EdgeInsets.only(top: 8),
+                child: Text(
+                  message,
+                  style: TextStyle(color: Theme.of(context).colorScheme.error),
+                ),
+              ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: state.groupsBusy ? null : () => Navigator.pop(context),
+          child: const Text('取消'),
+        ),
+        if (state.groupsUncertain || groups == null)
+          TextButton(
+            onPressed: state.groupsLoading || state.groupsBusy
+                ? null
+                : () => unawaited(controller.loadGroups()),
+            child: const Text('刷新状态'),
+          )
+        else
+          FilledButton(
+            onPressed:
+                state.groupsLoading ||
+                    state.groupsBusy ||
+                    !state.signedIn ||
+                    state.author?.following != true
+                ? null
+                : () async {
+                    if (await controller.saveGroups() && context.mounted) {
+                      Navigator.pop(context);
+                    }
+                  },
+            child: Text(state.groupsBusy ? '保存中' : '保存'),
+          ),
+      ],
+    );
+  }
+}

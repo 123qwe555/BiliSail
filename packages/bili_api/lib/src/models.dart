@@ -1,0 +1,473 @@
+import 'dart:async';
+
+import 'models/video_access.dart';
+import 'models/audio_loudness.dart';
+export 'models/audio_loudness.dart';
+export 'models/video_access.dart';
+
+enum ApiFailureCategory {
+  cancelled,
+  timeout,
+  network,
+  http,
+  rateLimited,
+  authentication,
+  permission,
+  notFound,
+  protocol,
+  unavailable,
+}
+
+final class ApiFailure implements Exception {
+  const ApiFailure(
+    this.category,
+    this.endpointId, {
+    this.httpStatus,
+    this.businessCode,
+    this.retryAfter,
+    this.videoAccessKind,
+  });
+
+  final ApiFailureCategory category;
+  final String endpointId;
+  final int? httpStatus;
+  final int? businessCode;
+  final Duration? retryAfter;
+  final ApiVideoAccessKind? videoAccessKind;
+
+  @override
+  String toString() =>
+      'ApiFailure($category, $endpointId, '
+      'httpStatus: $httpStatus, businessCode: $businessCode, '
+      'videoAccessKind: $videoAccessKind)';
+}
+
+final class ApiCancellation {
+  final Completer<void> _cancelled = Completer<void>();
+  final Set<void Function()> _listeners = {};
+  bool get isCancelled => _cancelled.isCompleted;
+  Future<void> get whenCancelled => _cancelled.future;
+
+  // Attempt signals need immediate propagation and detach after completion.
+  void Function() onCancel(void Function() listener) {
+    if (isCancelled) {
+      listener();
+      return () {};
+    }
+    _listeners.add(listener);
+    return () => _listeners.remove(listener);
+  }
+
+  void cancel() {
+    if (isCancelled) return;
+    _cancelled.complete();
+    for (final listener in _listeners.toList()) {
+      listener();
+    }
+    _listeners.clear();
+  }
+}
+
+final class ApiRequestContext {
+  const ApiRequestContext({
+    this.cancellation,
+    this.deadline,
+    this.sessionEpoch,
+  });
+  final ApiCancellation? cancellation;
+  final DateTime? deadline;
+  final int? sessionEpoch;
+}
+
+final class ApiPage<T> {
+  const ApiPage(
+    this.items, {
+    required this.hasMore,
+    this.nextCursor,
+    this.totalCount,
+  });
+  final List<T> items;
+  final bool hasMore;
+  final String? nextCursor;
+  final int? totalCount;
+}
+
+final class ApiVideoSummary {
+  const ApiVideoSummary({
+    required this.bvid,
+    required this.title,
+    required this.coverUrl,
+    required this.ownerName,
+    required this.duration,
+    this.playCount,
+    this.likeCount,
+    this.categoryName,
+    this.isFollowed,
+    this.danmakuCount,
+    this.publishedAt,
+    this.ownerAvatarUrl,
+    this.ownerMid,
+    this.recommendationReason,
+    this.recommendationFeedback,
+    this.previewCid,
+    this.access = const ApiVideoAccess(),
+  });
+  final String bvid;
+  final String title;
+  final Uri? coverUrl;
+  final String ownerName;
+  final Duration duration;
+  final int? playCount;
+  final int? likeCount;
+  final String? categoryName;
+  final bool? isFollowed;
+  final int? danmakuCount;
+  final DateTime? publishedAt;
+  final Uri? ownerAvatarUrl;
+  final String? ownerMid;
+  final String? recommendationReason;
+  final ApiRecommendationFeedback? recommendationFeedback;
+  final String? previewCid;
+  final ApiVideoAccess access;
+}
+
+final class ApiRecommendationFeedback {
+  const ApiRecommendationFeedback({
+    required this.aid,
+    required this.goto,
+    required this.trackId,
+    required this.ownerMid,
+  });
+  final String aid, goto, trackId, ownerMid;
+}
+
+final class ApiVideoPage {
+  const ApiVideoPage({
+    required this.cid,
+    required this.page,
+    required this.title,
+    required this.duration,
+  });
+  final String cid;
+  final int page;
+  final String title;
+  final Duration duration;
+}
+
+enum ApiCommentSort { hot, latest }
+
+final class ApiVideoComment {
+  const ApiVideoComment({
+    required this.id,
+    required this.author,
+    required this.avatarUrl,
+    required this.message,
+    required this.likeCount,
+    required this.publishedAt,
+    this.ipLocation,
+    this.liked = false,
+    this.replyCount = 0,
+    this.rootId,
+    this.parentId,
+    this.replies = const [],
+    this.level,
+    this.verifyType,
+    this.vipLabel,
+    this.medalName,
+    this.medalLevel,
+    this.decorationImageUrl,
+    this.decorationName,
+    this.decorationFanNumber,
+    this.decorationFanColor,
+    this.emotes = const {},
+    this.mentionedUsers = const {},
+    this.pictures = const [],
+    this.authorMid,
+    this.state,
+    this.invisible = false,
+    this.submissionMessage,
+  });
+  final int? state;
+  final bool invisible;
+  final String? submissionMessage;
+  final int? level, verifyType, medalLevel;
+  final String? vipLabel, medalName;
+  final Uri? decorationImageUrl;
+  final String? decorationName, decorationFanNumber;
+
+  /// Optional 24-bit RGB color of the decoration's fan serial number.
+  final int? decorationFanColor;
+  final Map<String, Uri> emotes;
+
+  /// Server-supplied mention names mapped to decimal user IDs.
+  final Map<String, String> mentionedUsers;
+  final List<Uri> pictures;
+  final bool liked;
+  final int replyCount;
+  final String? rootId;
+  final String? parentId;
+  final List<ApiVideoComment> replies;
+  final String id;
+  final String author;
+  final String? authorMid;
+  final Uri? avatarUrl;
+  final String message;
+  final int likeCount;
+  final DateTime? publishedAt;
+
+  /// Server-supplied display text from reply_control.location.
+  final String? ipLocation;
+}
+
+final class ApiVideoCollection {
+  const ApiVideoCollection({
+    required this.id,
+    required this.title,
+    required this.entries,
+    this.playCount,
+  });
+  final String id;
+  final String title;
+  final List<ApiVideoCollectionEntry> entries;
+  final int? playCount;
+}
+
+final class ApiVideoCollectionEntry {
+  const ApiVideoCollectionEntry({
+    required this.bvid,
+    required this.title,
+    this.pages = const [],
+    this.duration,
+  });
+  final String bvid;
+  final String title;
+  final Duration? duration;
+
+  /// Empty when the collection response omits parts; load video detail lazily.
+  final List<ApiVideoPage> pages;
+}
+
+/// A member of a video's joint submission, in server-supplied credit order.
+final class ApiVideoStaffMember {
+  const ApiVideoStaffMember({
+    required this.name,
+    required this.title,
+    this.mid,
+    this.avatarUrl,
+    this.highlightedRole = false,
+    this.nicknameColor,
+  });
+
+  final String name, title;
+  final String? mid;
+  final Uri? avatarUrl;
+  final bool highlightedRole;
+  final String? nicknameColor;
+}
+
+final class ApiVideoDetail {
+  const ApiVideoDetail({
+    required this.aid,
+    required this.bvid,
+    required this.title,
+    required this.description,
+    required this.coverUrl,
+    required this.ownerName,
+    required this.pages,
+    this.playCount,
+    this.danmakuCount,
+    this.publishedAt,
+    this.ownerAvatarUrl,
+    this.ownerMid,
+    this.likeCount,
+    this.coinCount,
+    this.favoriteCount,
+    this.collection,
+    this.replyCount,
+    this.staff = const [],
+    this.access = const ApiVideoAccess(),
+  });
+  final String aid;
+  final String bvid;
+  final String title;
+  final String description;
+  final Uri? coverUrl;
+  final String ownerName;
+  final List<ApiVideoPage> pages;
+  final int? playCount;
+  final int? danmakuCount;
+  final DateTime? publishedAt;
+  final Uri? ownerAvatarUrl;
+  final String? ownerMid;
+  final int? likeCount;
+  final int? coinCount;
+  final int? favoriteCount;
+  final ApiVideoCollection? collection;
+  final int? replyCount;
+  final List<ApiVideoStaffMember> staff;
+  final ApiVideoAccess access;
+}
+
+final class ApiMediaTrack {
+  const ApiMediaTrack({
+    required this.id,
+    required this.url,
+    required this.backupUrls,
+    required this.bandwidth,
+    required this.mimeType,
+    required this.codecs,
+  });
+  final int id;
+  final Uri url;
+  final List<Uri> backupUrls;
+  final int bandwidth;
+  final String mimeType;
+  final String codecs;
+}
+
+final class ApiPlayInfo {
+  const ApiPlayInfo({
+    required this.duration,
+    required this.dashVideo,
+    required this.dashAudio,
+    required this.acceptQuality,
+    this.isPreview = false,
+    this.voices = const [],
+    this.currentLanguage = '',
+    this.productionType = 0,
+    this.loudness,
+  });
+  final Duration duration;
+  final List<ApiMediaTrack> dashVideo;
+  final List<ApiMediaTrack> dashAudio;
+  final ApiAudioLoudness? loudness;
+  final List<int> acceptQuality;
+
+  /// The server supplied only a preview clip, not a complete episode.
+  final bool isPreview;
+  final List<ApiPlaybackVoice> voices;
+  final String currentLanguage;
+  final int productionType;
+}
+
+final class ApiPlaybackVoice {
+  const ApiPlaybackVoice({
+    required this.languageCode,
+    required this.label,
+    required this.productionType,
+    this.subtitleLanguage = '',
+    this.videoDetext = false,
+    this.videoMouthShapeChange = false,
+  });
+  final String languageCode, label, subtitleLanguage;
+  final int productionType;
+  final bool videoDetext, videoMouthShapeChange;
+}
+
+final class ApiSubtitleTrack {
+  const ApiSubtitleTrack({
+    required this.languageCode,
+    required this.label,
+    required this.url,
+    this.id = '',
+    this.type,
+    this.aiType,
+    this.aiStatus,
+  });
+  final String languageCode;
+  final String label;
+  final Uri url;
+  final String id;
+  final int? type, aiType, aiStatus;
+}
+
+final class ApiSubtitleCue {
+  const ApiSubtitleCue({
+    required this.start,
+    required this.end,
+    required this.text,
+  });
+  final Duration start;
+  final Duration end;
+  final String text;
+}
+
+final class ApiDanmakuItem {
+  const ApiDanmakuItem({
+    required this.id,
+    required this.progress,
+    required this.mode,
+    required this.fontSize,
+    required this.color,
+    required this.content,
+    this.weight = 0,
+    this.colorful = 0,
+  });
+  final String id;
+  final Duration progress;
+  final int mode;
+  final int fontSize;
+  final int color;
+  final String content;
+  final int weight;
+  final int colorful;
+}
+
+final class ApiQrCode {
+  const ApiQrCode({required this.url, required this.key});
+  final Uri url;
+  final String key;
+}
+
+enum ApiQrStatus { waitingScan, waitingConfirm, expired, confirmed }
+
+final class ApiQrPollResult {
+  const ApiQrPollResult(this.status);
+  final ApiQrStatus status;
+}
+
+final class ApiNavInfo {
+  const ApiNavInfo({
+    required this.isLogin,
+    this.isVip = false,
+    this.mid,
+    this.name,
+    this.avatarUrl,
+  });
+  final bool isLogin;
+  final bool isVip;
+  final String? mid;
+  final String? name;
+  final Uri? avatarUrl;
+}
+
+final class ApiCommentPicture {
+  const ApiCommentPicture(this.url, this.width, this.height, this.sizeKiB);
+  final Uri url;
+  final int width, height;
+  final double sizeKiB;
+  Map<String, Object> toJson() => {
+    'img_src': url.toString(),
+    'img_width': width,
+    'img_height': height,
+    'img_size': sizeKiB,
+  };
+}
+
+final class ApiCommentMention {
+  const ApiCommentMention(this.mid, this.name, this.avatarUrl);
+  final String mid, name;
+  final Uri? avatarUrl;
+}
+
+final class ApiCommentEmotePackage {
+  const ApiCommentEmotePackage(this.name, this.items);
+  final String name;
+  final List<ApiCommentEmote> items;
+}
+
+final class ApiCommentEmote {
+  const ApiCommentEmote(this.text, this.imageUrl);
+  final String text;
+  final Uri? imageUrl;
+}

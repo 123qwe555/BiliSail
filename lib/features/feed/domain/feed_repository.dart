@@ -1,0 +1,84 @@
+import '../../../domain/page_result.dart';
+import '../../../domain/request_cancellation.dart';
+import '../../../domain/video.dart';
+import 'popular_feed.dart';
+
+final class VideoCategory {
+  const VideoCategory({required this.id, required this.name});
+
+  final String id;
+  final String name;
+}
+
+abstract interface class FeedRepository {
+  Future<List<VideoCategory>> loadCategories({
+    required RequestCancellation cancellation,
+  });
+
+  /// A null category selects the recommendation feed.
+  Future<PageResult<VideoSummary>> loadFeed({
+    required int page,
+    required String? categoryId,
+    required RequestCancellation cancellation,
+  });
+
+  Future<PageResult<VideoSummary>> loadPopular({
+    required int page,
+    required RequestCancellation cancellation,
+  });
+}
+
+/// Rankings are an optional capability, separate from recommendation pagination.
+abstract interface class RankingFeedRepository {
+  /// Ranking region IDs are independent of the legacy newlist categories.
+  Future<List<VideoCategory>> loadRankingCategories({
+    required RequestCancellation cancellation,
+  });
+
+  Future<PageResult<VideoSummary>> loadRanking({
+    required String categoryId,
+    required RequestCancellation cancellation,
+  });
+}
+
+abstract interface class PopularFeedRepository {
+  Future<List<PopularWeek>> loadPopularWeeks({
+    required RequestCancellation cancellation,
+  });
+
+  Future<PageResult<VideoSummary>> loadPopularWeek({
+    required int number,
+    required RequestCancellation cancellation,
+  });
+
+  Future<PageResult<VideoSummary>> loadPrecious({
+    required RequestCancellation cancellation,
+  });
+}
+
+abstract interface class RecommendationFeedbackRepository {
+  String get feedbackScope;
+  Future<void> rejectRecommendation(
+    RecommendationFeedback feedback, {
+    required RequestCancellation cancellation,
+  });
+  Future<void> undoRecommendationFeedback(
+    RecommendationFeedback feedback, {
+    required RequestCancellation cancellation,
+  });
+}
+
+abstract interface class AppRecommendationFeedRepository {
+  Future<PageResult<VideoSummary>> loadAppRecommendations({
+    required int page,
+    required RequestCancellation cancellation,
+  });
+}
+
+/// Optional metadata for recommendation sources that omit publication times.
+abstract interface class RecommendationPublicationTimeRepository {
+  Future<DateTime?> loadPublicationTime(
+    VideoId id, {
+    required RequestCancellation cancellation,
+  });
+}

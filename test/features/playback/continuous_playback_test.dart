@@ -1,0 +1,1447 @@
+import 'dart:async';
+
+import 'package:bili_player/bili_player.dart';
+import 'package:bilisail/core/platform/window_service.dart';
+import 'package:bilisail/core/presentation/workspace_activity.dart';
+import 'package:bilisail/domain/request_cancellation.dart';
+import 'package:bilisail/domain/video.dart';
+import 'package:bilisail/domain/user.dart';
+import 'package:bilisail/domain/app_failure.dart';
+import 'package:bilisail/features/auth/application/auth_controller.dart';
+import 'package:bilisail/features/auth/domain/auth_repository.dart';
+import 'package:bilisail/features/pgc/application/pgc_controller.dart';
+import 'package:bilisail/features/pgc/domain/pgc_playback_sequence.dart';
+import 'package:bilisail/features/pgc/domain/pgc_repository.dart';
+import 'package:bilisail/features/pgc/presentation/pgc_screen.dart';
+import 'package:bilisail/features/profile/application/profile_controller.dart';
+import 'package:bilisail/features/profile/domain/profile_repository.dart';
+import 'package:bilisail/features/playback/application/playback_session.dart';
+import 'package:bilisail/features/playback/domain/content_playback.dart';
+import 'package:bilisail/features/playback/domain/playback_repository.dart';
+import 'package:bilisail/features/playback/presentation/playback_panel.dart';
+import 'package:bilisail/features/settings/domain/app_settings.dart';
+import 'package:bilisail/features/video/application/video_controller.dart';
+import 'package:bilisail/features/video/application/video_extras_controller.dart';
+import 'package:bilisail/features/video/application/watch_later_queue_registry.dart';
+import 'package:bilisail/features/video/domain/video_playback_sequence.dart';
+import 'package:bilisail/features/video/domain/watch_later_queue.dart';
+import 'package:bilisail/features/video/presentation/video_screen.dart';
+import 'package:bilisail/shared/ui/app_notice.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:flutter_test/flutter_test.dart';
+
+import '../../support/video_card_fake_engine.dart';
+
+const _a = VideoId('BV1234567890'), _b = VideoId('BV1234567891');
+const _parts = [
+  VideoPart(cid: '101', page: 1, title: 'P1', duration: Duration(seconds: 20)),
+  VideoPart(cid: '102', page: 2, title: 'P2', duration: Duration(seconds: 20)),
+];
+const _third = VideoPart(
+  cid: '103',
+  page: 1,
+  title: 'B1',
+  duration: Duration(seconds: 20),
+);
+const _collection = VideoCollection(
+  id: '1',
+  title: '测试合集',
+  entries: [
+    VideoCollectionEntry(id: _a, title: 'A', parts: _parts),
+    VideoCollectionEntry(id: _b, title: 'B', parts: [_third]),
+  ],
+);
+VideoDetail _video(VideoId id, List<VideoPart> parts) => VideoDetail(
+  summary: VideoSummary(
+    id: id,
+    title: id == _a ? '视频 A' : '视频 B',
+    coverUrl: '',
+    author: 'UP',
+    duration: const Duration(seconds: 20),
+  ),
+  description: '',
+  parts: parts,
+  collection: _collection,
+);
+const _episodes = [
+  PgcEpisode(
+    id: PgcEpisodeId('1'),
+    title: '1',
+    bvid: 'BV1234567890',
+    cid: '101',
+  ),
+  PgcEpisode(
+    id: PgcEpisodeId('2'),
+    title: '2',
+    bvid: 'BV1234567890',
+    cid: '102',
+  ),
+  PgcEpisode(
+    id: PgcEpisodeId('3'),
+    title: 'SP',
+    bvid: 'BV1234567891',
+    cid: '103',
+    sectionTitle: 'SP',
+  ),
+];
+final _season = PgcSeason(
+  id: const PgcSeasonId('1'),
+  title: '影视',
+  episodes: _episodes,
+);
+
+void main() {
+  test(
+    'video order prioritizes parts, then collection or originating queue',
+    () {
+      final a = _video(_a, _parts), b = _video(_b, [_third]);
+      expect(adjacentVideoSource(a, '101', 1), (id: _a, cid: '102'));
+      expect(adjacentVideoSource(a, '102', 1), (id: _b, cid: '103'));
+      expect(adjacentVideoSource(b, '103', 1), isNull);
+      expect(adjacentVideoSource(a, 'missing', 1), isNull);
+      final queue = WatchLaterQueue(
+        id: '1',
+        scope: 'guest',
+        sessionEpoch: 0,
+        items: [
+          WatchLaterQueueItem(video: b.summary),
+          WatchLaterQueueItem(video: a.summary),
+        ],
+      );
+      expect(adjacentVideoSource(a, '102', 1, queue: queue), isNull);
+      expect(adjacentVideoSource(b, '103', 1, queue: queue), (
+        id: _a,
+        cid: null,
+      ));
+    },
+  );
+
+  test(
+    'PGC stays within the current section and stops at unavailable episodes',
+    () {
+      expect(adjacentPgcEpisode(_season, _episodes[0], 1), _episodes[1]);
+      expect(adjacentPgcEpisode(_season, _episodes[1], 1), isNull);
+      expect(adjacentPgcEpisode(_season, _episodes[2], 1), isNull);
+      final restricted = PgcSeason(
+        id: _season.id,
+        title: '',
+        episodes: [
+          _episodes[0],
+          const PgcEpisode(id: PgcEpisodeId('4'), title: '4', available: false),
+          _episodes[1],
+        ],
+      );
+      expect(adjacentPgcEpisode(restricted, _episodes[0], 1), isNull);
+    },
+  );
+
+  test(
+    'list loops use the outer sequence and preserve PGC section restrictions',
+    () {
+      final a = _video(_a, _parts), b = _video(_b, [_third]);
+      expect(firstVideoSource(b), (id: _a, cid: '101'));
+      final queue = WatchLaterQueue(
+        id: 'queue',
+        scope: 'guest',
+        sessionEpoch: 0,
+        items: [
+          WatchLaterQueueItem(video: b.summary),
+          WatchLaterQueueItem(video: a.summary),
+        ],
+      );
+      expect(firstVideoSource(a, queue: queue), (id: _b, cid: null));
+      expect(
+        adjacentPgcEpisode(_season, _episodes[1], 1, loop: true),
+        _episodes[0],
+      );
+      expect(
+        adjacentPgcEpisode(_season, _episodes[2], 1, loop: true),
+        _episodes[2],
+      );
+      final restricted = PgcSeason(
+        id: _season.id,
+        title: '',
+        episodes: [
+          const PgcEpisode(id: PgcEpisodeId('4'), title: '4', available: false),
+          _episodes[1],
+        ],
+      );
+      expect(
+        adjacentPgcEpisode(restricted, _episodes[1], 1, loop: true),
+        isNull,
+      );
+    },
+  );
+
+  for (final kind in ['parts', 'collection', 'queue', 'single']) {
+    for (final listening in [false, true]) {
+      testWidgets('list looping wraps $kind and retains listening=$listening', (
+        tester,
+      ) async {
+        final engine = _Engine();
+        final session = _session(engine);
+        addTearDown(session.close);
+        VideoDetail standalone(List<VideoPart> parts) => VideoDetail(
+          summary: _video(_a, parts).summary,
+          description: '',
+          parts: parts,
+        );
+        final a = kind == 'parts'
+            ? standalone(_parts)
+            : kind == 'single'
+            ? standalone([_parts[0]])
+            : _video(_a, _parts);
+        final b = _video(_b, [_third]);
+        final queue = kind == 'queue'
+            ? WatchLaterQueue(
+                id: 'loop',
+                scope: 'guest',
+                sessionEpoch: 0,
+                items: [
+                  WatchLaterQueueItem(video: b.summary),
+                  WatchLaterQueueItem(video: a.summary),
+                ],
+              )
+            : null;
+        var id = kind == 'collection' ? _b : _a;
+        String? cid = kind == 'single'
+            ? '101'
+            : kind == 'parts' || kind == 'queue'
+            ? '102'
+            : '103';
+        await tester.pumpWidget(
+          ProviderScope(
+            overrides: [
+              playbackSessionProvider.overrideWithValue(session),
+              authControllerProvider.overrideWith(_Auth.new),
+              for (final video in [a, b]) ...[
+                videoDetailProvider(video.summary.id)
+                    .overrideWith((_) => video),
+                relatedVideosProvider(video.summary.id)
+                    .overrideWith((_) => const []),
+                videoTagsProvider(video.summary.id)
+                    .overrideWith((_) => const []),
+              ],
+            ],
+            child: MaterialApp(
+              home: Scaffold(
+                body: StatefulBuilder(
+                  builder: (_, update) => VideoScreen(
+                    id: id,
+                    initialCid: cid,
+                    queue: queue,
+                    onPartChanged: (part) => update(() => cid = part.cid),
+                    onAdvanceVideo: (next, nextCid) => update(() {
+                      id = next;
+                      cid = nextCid;
+                    }),
+                    onOpenQueueVideo: (next) => update(() {
+                      id = next;
+                      cid = null;
+                    }),
+                    playerBuilder: (_, detail, part) => PlaybackPanel(
+                      detail: detail,
+                      part: part,
+                      settings: AppSettings(
+                        playbackMode: PlaybackMode.listLoop,
+                        danmakuEnabled: false,
+                      ),
+                      window: _Window(),
+                      onToggleComments: () {},
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        );
+        await _frames(tester);
+        if (listening) await session.setAudioOnly(true);
+        final opens = engine.opens;
+        engine.end();
+        engine.end();
+        await _frames(tester);
+        expect(session.detail?.summary.id, kind == 'queue' ? _b : _a);
+        expect(session.part?.cid, kind == 'queue' ? '103' : '101');
+        expect(session.audioOnly, listening);
+        expect(session.snapshots.value.phase, PlaybackPhase.playing);
+        if (kind == 'single') {
+          expect(engine.opens, opens);
+          expect(engine.seeks, 1);
+          engine.end();
+          await _frames(tester);
+          expect(engine.seeks, 2);
+        } else {
+          expect(engine.opens, opens + 1);
+          expect(engine.options?.startPosition, Duration.zero);
+        }
+        expect(tester.takeException(), isNull);
+        await tester.pumpWidget(const SizedBox.shrink());
+        await _frames(tester);
+      });
+    }
+  }
+
+  for (final mode in [PlaybackMode.singleLoop, PlaybackMode.listLoop]) {
+    testWidgets('$mode repeats a standalone or offline source more than once', (
+      tester,
+    ) async {
+      final engine = _Engine();
+      final session = _session(engine);
+      addTearDown(session.close);
+      final video = _video(_a, _parts);
+      await tester.pumpWidget(
+        ProviderScope(
+          overrides: [playbackSessionProvider.overrideWithValue(session)],
+          child: MaterialApp(
+            home: Scaffold(
+              body: PlaybackPanel(
+                detail: video,
+                part: _parts.first,
+                target: mode == PlaybackMode.listLoop
+                    ? const OfflinePlaybackTarget('offline')
+                    : null,
+                settings: AppSettings(
+                  playbackMode: mode,
+                  danmakuEnabled: false,
+                ),
+                window: _Window(),
+                onToggleComments: () {},
+              ),
+            ),
+          ),
+        ),
+      );
+      await _frames(tester);
+      final opens = engine.opens;
+      for (var repeat = 1; repeat <= 3; repeat++) {
+        engine.end();
+        engine.end();
+        await _frames(tester);
+        expect(engine.opens, opens);
+        expect(engine.seeks, repeat);
+        expect(session.snapshots.value.phase, PlaybackPhase.playing);
+        expect(session.snapshots.value.position, Duration.zero);
+      }
+      await tester.pumpWidget(const SizedBox.shrink());
+      await _frames(tester);
+    });
+
+    testWidgets('expired timer blocks $mode without acknowledging it', (
+      tester,
+    ) async {
+      final engine = _Engine();
+      final session = _session(engine, now: tester.binding.clock.now);
+      addTearDown(session.close);
+      session.configureSettings(AppSettings(playbackMode: mode));
+      await session.open(_video(_a, _parts), _parts.first);
+      await session.setAudioOnly(true);
+      session.sleepTimer.start(const Duration(milliseconds: 1));
+      await tester.pump(const Duration(milliseconds: 2));
+      engine.end();
+      await session.repeatCompleted(session.sourceGeneration);
+      expect(session.sleepTimer.elapsed, isTrue);
+      expect(engine.seeks, 0);
+      expect(session.snapshots.value.desiredPlaying, isFalse);
+    });
+  }
+
+  testWidgets('PGC list looping wraps within the selected section', (
+    tester,
+  ) async {
+    final engine = _Engine();
+    final session = _session(engine);
+    addTearDown(session.close);
+    await tester.pumpWidget(
+      ProviderScope(
+        overrides: [
+          playbackSessionProvider.overrideWithValue(session),
+          authControllerProvider.overrideWith(_Auth.new),
+          pgcRepositoryProvider.overrideWithValue(_PgcRepo()),
+        ],
+        child: MaterialApp(
+          home: Scaffold(
+            body: PgcScreen(
+              seasonId: '1',
+              playerBuilder: (_, season, episode) {
+                final part = _parts.firstWhere(
+                  (part) => part.cid == episode.cid,
+                );
+                return PlaybackPanel(
+                  detail: _video(_a, [part]),
+                  part: part,
+                  target: PgcPlaybackTarget(
+                    episode.episodeId,
+                    cid: episode.cid,
+                  ),
+                  settings: AppSettings(
+                    playbackMode: PlaybackMode.listLoop,
+                    danmakuEnabled: false,
+                  ),
+                  window: _Window(),
+                  onToggleComments: () {},
+                );
+              },
+            ),
+          ),
+        ),
+      ),
+    );
+    await _frames(tester);
+    for (final cid in ['102', '101', '102']) {
+      engine.end();
+      engine.end();
+      await _frames(tester);
+      expect(session.danmakuCid, cid);
+      expect(engine.options?.startPosition, Duration.zero);
+    }
+    await tester.pumpWidget(const SizedBox.shrink());
+    await _frames(tester);
+  });
+
+  test('failed automatic replay seek stops without playing or replaying the command', () async {
+    final engine = _Engine();
+    final session = _session(engine);
+    addTearDown(session.close);
+    session.configureSettings(
+      AppSettings(playbackMode: PlaybackMode.singleLoop),
+    );
+    await session.open(_video(_a, _parts), _parts.first);
+    engine.end();
+    engine.playCommands = 0;
+    engine.seekFailure = const PlayerFailure(
+      PlayerFailureKind.nativePlayback,
+      'seek failed',
+      0,
+    );
+    await session.repeatCompleted(session.sourceGeneration);
+    expect(engine.playCommands, 0);
+    expect(session.error, 'seek failed');
+    expect(session.snapshots.value.desiredPlaying, isFalse);
+  });
+
+  for (final manualPlay in [false, true]) {
+    test(
+      'late failed loop seek cannot overwrite manual ${manualPlay ? 'play' : 'seek'}',
+      () async {
+        final engine = _Engine();
+        final session = _session(engine);
+        addTearDown(session.close);
+        session.configureSettings(
+          AppSettings(playbackMode: PlaybackMode.singleLoop),
+        );
+        await session.open(_video(_a, _parts), _parts.first);
+        engine.end();
+        engine.playCommands = 0;
+        engine.seekFailure = const PlayerFailure(
+          PlayerFailureKind.nativePlayback,
+          'old seek failed',
+          0,
+        );
+        final pending = engine.seeking = Completer<void>();
+        final repeat = session.repeatCompleted(session.sourceGeneration);
+        await Future<void>.delayed(Duration.zero);
+        engine.seekFailure = null;
+        final manual = manualPlay
+            ? session.play()
+            : session.seek(const Duration(seconds: 7));
+        engine.seeking = null;
+        pending.complete();
+        await repeat;
+        await manual;
+        expect(session.error, isNull);
+        expect(
+          engine.snapshot.position,
+          manualPlay ? Duration.zero : const Duration(seconds: 7),
+        );
+        expect(engine.playCommands, manualPlay ? 1 : 0);
+      },
+    );
+  }
+
+  for (final action in [
+    'pause',
+    'seek',
+    'source',
+    'permission',
+    'mode',
+    'mode_restore',
+    'account',
+  ]) {
+    test('automatic replay yields to $action during its seek', () async {
+      final engine = _Engine();
+      var epoch = 0;
+      final session = _session(engine, epoch: () => epoch);
+      addTearDown(session.close);
+      session.configureSettings(
+        AppSettings(playbackMode: PlaybackMode.singleLoop),
+      );
+      await session.open(_video(_a, _parts), _parts.first);
+      engine.end();
+      engine.playCommands = 0;
+      final pending = engine.seeking = Completer<void>();
+      final replay = session.repeatCompleted(session.sourceGeneration);
+      await Future<void>.delayed(Duration.zero);
+      Future<void>? other;
+      switch (action) {
+        case 'pause':
+          other = session.pause();
+        case 'seek':
+          other = session.seek(const Duration(seconds: 7));
+        case 'source':
+          other = session.open(
+            _video(_b, [_third]),
+            _third,
+            desiredPlaying: false,
+          );
+        case 'permission':
+          other = session.setPlaybackAllowed(false);
+        case 'mode':
+          session.configureSettings(
+            AppSettings(playbackMode: PlaybackMode.pause),
+          );
+        case 'mode_restore':
+          session.configureSettings(
+            AppSettings(playbackMode: PlaybackMode.pause),
+          );
+          session.configureSettings(
+            AppSettings(playbackMode: PlaybackMode.singleLoop),
+          );
+        case 'account':
+          epoch++;
+      }
+      engine.seeking = null;
+      pending.complete();
+      await replay;
+      await other;
+      expect(engine.playCommands, 0);
+      if (action == 'seek') {
+        expect(engine.snapshot.position, const Duration(seconds: 7));
+      }
+      if (action == 'source') expect(session.detail?.summary.id, _b);
+    });
+  }
+
+  for (final width in [390.0, 1400.0]) {
+    for (final fullscreen in [false, true]) {
+      testWidgets(
+        'manual and continuous parts and collection width=$width fullscreen=$fullscreen',
+        (tester) async {
+          tester.view.devicePixelRatio = 1;
+          tester.view.physicalSize = Size(width, 900);
+          addTearDown(tester.view.resetDevicePixelRatio);
+          addTearDown(tester.view.resetPhysicalSize);
+          final engine = _Engine();
+          final session = _session(engine);
+          addTearDown(session.close);
+          final settings = ValueNotifier(
+            AppSettings(continuousPlayback: false, danmakuEnabled: false),
+          );
+          addTearDown(settings.dispose);
+          var id = _a;
+          String? cid;
+          final window = _Window();
+          await tester.pumpWidget(
+            ProviderScope(
+              overrides: [
+                playbackSessionProvider.overrideWithValue(session),
+                authControllerProvider.overrideWith(_Auth.new),
+                for (final video in [
+                  _video(_a, _parts),
+                  _video(_b, [_third]),
+                ]) ...[
+                  videoDetailProvider(video.summary.id).overrideWith((_) async {
+                    if (video.summary.id == _b) {
+                      await Future<void>.delayed(
+                        const Duration(milliseconds: 50),
+                      );
+                    }
+                    return video;
+                  }),
+                  relatedVideosProvider(video.summary.id)
+                      .overrideWith((_) => const []),
+                  videoTagsProvider(video.summary.id)
+                      .overrideWith((_) => const []),
+                ],
+              ],
+              child: MaterialApp(
+                builder: AppNoticeHost.builder,
+                home: Scaffold(
+                  body: ValueListenableBuilder(
+                    valueListenable: settings,
+                    builder: (_, value, _) => StatefulBuilder(
+                      builder: (_, update) => VideoScreen(
+                        id: id,
+                        initialCid: cid,
+                        onPartChanged: (part) => update(() => cid = part.cid),
+                        onAdvanceVideo: (next, nextCid) => update(() {
+                          id = next;
+                          cid = nextCid;
+                        }),
+                        playerBuilder: (_, detail, part) => PlaybackPanel(
+                          detail: detail,
+                          part: part,
+                          settings: value,
+                          onToggleComments: () {},
+                          window: window,
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          );
+          await _frames(tester);
+          await tester.tapAt(
+            tester.getTopLeft(
+                  find.byKey(const ValueKey('player-surface-tap-target')),
+                ) +
+                const Offset(130, 70),
+          );
+          await tester.pump(const Duration(milliseconds: 350));
+          await tester.pump(const Duration(milliseconds: 216));
+          if (fullscreen) {
+            await tester.tap(find.byTooltip('全屏（F）'));
+            await _frames(tester);
+          }
+          engine.end();
+          await _frames(tester);
+          expect(session.part?.cid, '101');
+          expect(engine.opens, 1);
+          final next = find.byKey(const ValueKey('player-next-episode'));
+          expect(next, findsOneWidget);
+          expect(tester.widget<IconButton>(next).onPressed, isNotNull);
+          await tester.tap(next);
+          await _frames(tester);
+          expect(session.part?.cid, '102');
+          expect(session.snapshots.value.desiredPlaying, isTrue);
+          settings.value = settings.value.copyWith(continuousPlayback: true);
+          await _frames(tester);
+          engine.end();
+          engine.end();
+          await _frames(tester);
+          expect(session.detail?.summary.id, _b);
+          expect(session.part?.cid, '103');
+          expect(engine.opens, 3);
+          expect(engine.options?.startPosition, Duration.zero);
+          expect(session.snapshots.value.desiredPlaying, isTrue);
+          expect(window.fullscreen, fullscreen);
+          expect(tester.widget<IconButton>(next).onPressed, isNull);
+          engine.end();
+          await _frames(tester);
+          expect(engine.opens, 3);
+          expect(session.snapshots.value.phase, PlaybackPhase.ended);
+          expect(tester.takeException(), isNull);
+          await tester.pumpWidget(const SizedBox());
+          await _frames(tester);
+        },
+      );
+    }
+  }
+
+  for (final mode in ['video', 'manual', 'disabled']) {
+    testWidgets('parts, collection and related playback preserve $mode mode', (
+      tester,
+    ) async {
+      final engine = _Engine();
+      final session = _session(engine);
+      addTearDown(session.close);
+      const c = VideoId('BV1234567892');
+      final videos = {
+        _a: _video(_a, _parts),
+        _b: _video(_b, [_third]),
+        c: VideoDetail(
+          summary: const VideoSummary(
+            id: c,
+            title: '相关视频',
+            coverUrl: '',
+            author: 'UP',
+            duration: Duration(seconds: 20),
+          ),
+          description: '',
+          parts: const [_third],
+        ),
+      };
+      var id = _a;
+      String? cid;
+      var advances = 0;
+      await tester.pumpWidget(
+        ProviderScope(
+          overrides: [
+            playbackSessionProvider.overrideWithValue(session),
+            authControllerProvider.overrideWith(_Auth.new),
+            for (final video in videos.values) ...[
+              videoDetailProvider(video.summary.id)
+                  .overrideWith((_) async => video),
+              relatedVideosProvider(video.summary.id)
+                  .overrideWith((_) => const []),
+              filteredRelatedVideosProvider(video.summary.id).overrideWith(
+                (_) => video.summary.id == c
+                    ? const []
+                    : [video.summary, videos[c]!.summary],
+              ),
+              videoTagsProvider(video.summary.id).overrideWith((_) => const []),
+            ],
+          ],
+          child: MaterialApp(
+            builder: AppNoticeHost.builder,
+            home: Scaffold(
+              body: StatefulBuilder(
+                builder: (_, update) => VideoScreen(
+                  id: id,
+                  initialCid: cid,
+                  onPartChanged: (part) => update(() => cid = part.cid),
+                  onAdvanceVideo: (next, nextCid) => update(() {
+                    advances++;
+                    id = next;
+                    cid = nextCid;
+                  }),
+                  playerBuilder: (_, detail, part) => PlaybackPanel(
+                    detail: detail,
+                    part: part,
+                    settings: AppSettings(
+                      continuousPlayback: true,
+                      continuousRelatedPlayback: mode != 'disabled',
+                      danmakuEnabled: false,
+                    ),
+                    window: _Window(),
+                    onToggleComments: () {},
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      );
+      await _frames(tester);
+      if (mode == 'manual') await session.setAudioOnly(true);
+      final listening = mode == 'manual';
+      for (final expected in ['102', '103']) {
+        engine.end();
+        engine.end();
+        await _frames(tester);
+        expect(session.part?.cid, expected);
+        expect(session.audioOnly, listening);
+        expect(
+          engine.source,
+          listening ? isA<ProgressiveSource>() : isA<DashPairSource>(),
+        );
+      }
+      expect(session.detail?.summary.id, _b);
+      engine.end();
+      engine.end();
+      await _frames(tester);
+      expect(session.detail?.summary.id, mode == 'disabled' ? _b : c);
+      expect(advances, mode == 'disabled' ? 1 : 2);
+      expect(session.audioOnly, listening);
+      if (mode != 'disabled') {
+        expect(engine.options?.startPosition, Duration.zero);
+        expect(
+          engine.source,
+          listening ? isA<ProgressiveSource>() : isA<DashPairSource>(),
+        );
+        engine.end();
+        await _frames(tester);
+        expect(advances, 2);
+      }
+      await tester.pumpWidget(const SizedBox.shrink());
+      await _frames(tester);
+    });
+  }
+
+  for (final cancel in [
+    'none',
+    'pause',
+    'setting',
+    'account',
+    'dispose',
+    'error',
+  ]) {
+    testWidgets('pending related completion stops on $cancel', (tester) async {
+      var epoch = 0;
+      final engine = _Engine();
+      final session = _session(engine, epoch: () => epoch);
+      addTearDown(session.close);
+      final pending = Completer<List<VideoSummary>>();
+      var advances = 0;
+      final video = _video(_b, [_third]);
+      final settings = ValueNotifier(
+        AppSettings(continuousRelatedPlayback: true, danmakuEnabled: false),
+      );
+      addTearDown(settings.dispose);
+      await tester.pumpWidget(
+        ProviderScope(
+          overrides: [
+            playbackSessionProvider.overrideWithValue(session),
+            authControllerProvider.overrideWith(_Auth.new),
+            videoDetailProvider(_b).overrideWith((_) => video),
+            relatedVideosProvider(_b).overrideWith((_) => const []),
+            filteredRelatedVideosProvider(_b)
+                .overrideWith((_) => pending.future),
+            videoTagsProvider(_b).overrideWith((_) => const []),
+          ],
+          child: MaterialApp(
+            builder: AppNoticeHost.builder,
+            home: Scaffold(
+              body: ValueListenableBuilder(
+                valueListenable: settings,
+                builder: (_, value, _) => VideoScreen(
+                  id: _b,
+                  onAdvanceVideo: (_, _) => advances++,
+                  playerBuilder: (_, detail, part) => PlaybackPanel(
+                    detail: detail,
+                    part: part,
+                    settings: value,
+                    window: _Window(),
+                    onToggleComments: () {},
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      );
+      await _frames(tester);
+      engine.end();
+      await _frames(tester);
+      switch (cancel) {
+        case 'pause':
+          await session.pause();
+        case 'setting':
+          settings.value = settings.value.copyWith(
+            continuousRelatedPlayback: false,
+          );
+        case 'account':
+          epoch++;
+        case 'dispose':
+          await tester.pumpWidget(const SizedBox.shrink());
+        case 'error':
+        case 'none':
+          break;
+      }
+      await _frames(tester);
+      if (cancel == 'error') {
+        pending.completeError(const AppFailure(AppFailureKind.network, '网络异常'));
+      } else {
+        pending.complete([_video(_a, _parts).summary]);
+      }
+      await _frames(tester);
+      expect(advances, cancel == 'none' ? 1 : 0);
+      expect(tester.takeException(), isNull);
+      await tester.pumpWidget(const SizedBox.shrink());
+      await _frames(tester);
+    });
+  }
+
+  for (final background in [false, true]) {
+    testWidgets('PGC next episode keeps playback mode background=$background', (
+      tester,
+    ) async {
+      final engine = _Engine();
+      final session = _session(engine);
+      addTearDown(session.close);
+      await tester.pumpWidget(
+        ProviderScope(
+          overrides: [
+            playbackSessionProvider.overrideWithValue(session),
+            authControllerProvider.overrideWith(_Auth.new),
+            pgcRepositoryProvider.overrideWithValue(_PgcRepo()),
+          ],
+          child: MaterialApp(
+            home: Scaffold(
+              body: PgcScreen(
+                seasonId: '1',
+                playerBuilder: (_, season, episode) {
+                  final part = _parts.firstWhere(
+                    (part) => part.cid == episode.cid,
+                  );
+                  return PlaybackPanel(
+                    detail: _video(_a, [part]),
+                    part: part,
+                    target: PgcPlaybackTarget(
+                      episode.episodeId,
+                      cid: episode.cid,
+                    ),
+                    settings: AppSettings(
+                      continuousPlayback: true,
+                      continuousRelatedPlayback: true,
+                      danmakuEnabled: false,
+                    ),
+                    window: _Window(),
+                    onToggleComments: () {},
+                  );
+                },
+              ),
+            ),
+          ),
+        ),
+      );
+      await _frames(tester);
+      if (background) {
+        tester.binding.handleAppLifecycleStateChanged(
+          AppLifecycleState.inactive,
+        );
+        tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.hidden);
+        tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.paused);
+        addTearDown(
+          () => tester.binding.handleAppLifecycleStateChanged(
+            AppLifecycleState.resumed,
+          ),
+        );
+      } else {
+        await session.setAudioOnly(true);
+      }
+      engine.end();
+      engine.end();
+      await _frames(tester);
+      expect(session.contentTarget, const PgcPlaybackTarget('2', cid: '102'));
+      expect(session.audioOnly, !background);
+      expect(
+        engine.source,
+        background ? isA<DashPairSource>() : isA<ProgressiveSource>(),
+      );
+      expect(engine.options?.startPosition, Duration.zero);
+      engine.end();
+      await _frames(tester);
+      expect(session.contentTarget, const PgcPlaybackTarget('2', cid: '102'));
+      if (background) {
+        tester.binding.handleAppLifecycleStateChanged(
+          AppLifecycleState.resumed,
+        );
+      }
+      expect(session.audioOnly, !background);
+      await tester.pumpWidget(const SizedBox.shrink());
+      await _frames(tester);
+    });
+  }
+
+  testWidgets(
+    'explicit queue keeps its boundary with related autoplay enabled',
+    (tester) async {
+      final engine = _Engine();
+      final session = _session(engine);
+      addTearDown(session.close);
+      final a = _video(_a, _parts), b = _video(_b, [_third]);
+      final queue = WatchLaterQueue(
+        id: 'queue',
+        scope: 'guest',
+        sessionEpoch: 0,
+        items: [
+          WatchLaterQueueItem(video: a.summary),
+          WatchLaterQueueItem(video: b.summary),
+        ],
+      );
+      var id = _a;
+      String? cid;
+      await tester.pumpWidget(
+        ProviderScope(
+          overrides: [
+            playbackSessionProvider.overrideWithValue(session),
+            authControllerProvider.overrideWith(_Auth.new),
+            for (final video in [a, b]) ...[
+              videoDetailProvider(video.summary.id).overrideWith((_) => video),
+              relatedVideosProvider(video.summary.id)
+                  .overrideWith((_) => [a.summary]),
+              videoTagsProvider(video.summary.id).overrideWith((_) => const []),
+            ],
+          ],
+          child: MaterialApp(
+            home: Scaffold(
+              body: StatefulBuilder(
+                builder: (_, update) => VideoScreen(
+                  id: id,
+                  initialCid: cid,
+                  queue: queue,
+                  onOpenQueueVideo: (next) => update(() {
+                    id = next;
+                    cid = null;
+                  }),
+                  onPartChanged: (part) => update(() => cid = part.cid),
+                  playerBuilder: (_, detail, part) => PlaybackPanel(
+                    detail: detail,
+                    part: part,
+                    settings: AppSettings(
+                      continuousPlayback: true,
+                      continuousRelatedPlayback: true,
+                      danmakuEnabled: false,
+                    ),
+                    window: _Window(),
+                    onToggleComments: () {},
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      );
+      await _frames(tester);
+      await session.setAudioOnly(true);
+      for (final expected in ['102', '103']) {
+        engine.end();
+        await _frames(tester);
+        expect(session.part?.cid, expected);
+        expect(session.audioOnly, isTrue);
+        expect(engine.source, isA<ProgressiveSource>());
+      }
+      engine.end();
+      await _frames(tester);
+      expect(session.detail?.summary.id, _b);
+      expect(session.snapshots.value.phase, PlaybackPhase.ended);
+      await tester.pumpWidget(const SizedBox.shrink());
+      await _frames(tester);
+    },
+  );
+
+  testWidgets(
+    'hidden PGC page continues once and starts next episode at zero',
+    (tester) async {
+      final engine = _Engine();
+      final repository = _PlaybackRepo();
+      final session = _session(engine, repository: repository);
+      addTearDown(session.close);
+      final visible = ValueNotifier(true);
+      addTearDown(visible.dispose);
+      await tester.pumpWidget(
+        ProviderScope(
+          overrides: [
+            playbackSessionProvider.overrideWithValue(session),
+            authControllerProvider.overrideWith(_Auth.new),
+            pgcRepositoryProvider.overrideWithValue(_PgcRepo()),
+          ],
+          child: MaterialApp(
+            builder: AppNoticeHost.builder,
+            home: Scaffold(
+              body: ValueListenableBuilder(
+                valueListenable: visible,
+                builder: (_, active, _) => Offstage(
+                  offstage: !active,
+                  child: WorkspaceActivity(
+                    active: active,
+                    child: PgcScreen(
+                      seasonId: '1',
+                      playerBuilder: (_, season, episode) {
+                        final part = _parts.firstWhere(
+                          (part) => part.cid == episode.cid,
+                        );
+                        return PlaybackPanel(
+                          detail: _video(_a, [part]),
+                          part: part,
+                          target: PgcPlaybackTarget(
+                            episode.episodeId,
+                            cid: episode.cid,
+                          ),
+                          settings: AppSettings(
+                            continuousPlayback: true,
+                            danmakuEnabled: true,
+                          ),
+                          onToggleComments: () {},
+                          window: _Window(),
+                        );
+                      },
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      );
+      await _frames(tester);
+      expect(session.contentTarget, const PgcPlaybackTarget('1', cid: '101'));
+      expect(repository.commentRequests, isNotEmpty);
+      visible.value = false;
+      await _frames(tester);
+      final requests = repository.commentRequests.length;
+      engine.end();
+      engine.end();
+      await _frames(tester);
+      expect(session.contentTarget, const PgcPlaybackTarget('2', cid: '102'));
+      expect(engine.options?.startPosition, Duration.zero);
+      expect(session.snapshots.value.desiredPlaying, isTrue);
+      expect(repository.commentRequests, hasLength(requests));
+      var commentNotifications = 0;
+      session.danmaku.addListener(() => commentNotifications++);
+      engine.publish(
+        engine.snapshot.copyWith(position: const Duration(seconds: 10)),
+      );
+      await _frames(tester);
+      expect(commentNotifications, 0);
+      expect(repository.commentRequests, hasLength(requests));
+      expect(session.snapshots.value.position, const Duration(seconds: 10));
+      visible.value = true;
+      await _frames(tester);
+      expect(repository.commentRequests, contains('102:1'));
+      expect(session.danmaku.frame().map((item) => item.event.id), ['current']);
+      expect(engine.opens, 2);
+      engine.end();
+      await _frames(tester);
+      expect(engine.opens, 2);
+      await tester.pumpWidget(const SizedBox());
+      await _frames(tester);
+    },
+  );
+
+  test(
+    'next source rejects account epoch changes and preserves manual pause',
+    () async {
+      var epoch = 0;
+      final engine = _Engine();
+      final session = _session(engine, epoch: () => epoch);
+      final owner = Object();
+      session.attach(owner);
+      session.configureSettings(AppSettings(autoPlay: false));
+      final video = _video(_a, _parts);
+      await session.activate(owner, video, _parts[0]);
+      expect(
+        session.prepareNextVideo(_a, '101', nextId: _a, nextCid: '102'),
+        isTrue,
+      );
+      await session.activate(owner, video, _parts[1]);
+      expect(engine.options?.play, isFalse);
+      engine.end();
+      epoch++;
+      expect(
+        session.prepareNextVideo(_a, '102', nextId: _b, completed: true),
+        isFalse,
+      );
+      await session.close();
+    },
+  );
+
+  for (final cancel in ['none', 'mode', 'mode_restore', 'source']) {
+    testWidgets(
+      'failed first-page loop retries explicitly and respects $cancel',
+      (tester) async {
+        tester.view.devicePixelRatio = 1;
+        tester.view.physicalSize = const Size(1400, 900);
+        addTearDown(tester.view.resetDevicePixelRatio);
+        addTearDown(tester.view.resetPhysicalSize);
+        final engine = _Engine();
+        final session = _session(engine);
+        addTearDown(session.close);
+        final registry = WatchLaterQueueRegistry();
+        final repository = _ProfileQueueRepo();
+        final a = _video(_a, _parts), b = _video(_b, [_third]);
+        const c = VideoId('BV1234567892');
+        final other = VideoDetail(
+          summary: VideoSummary(
+            id: c,
+            title: '其他视频',
+            coverUrl: '',
+            author: 'UP',
+            duration: const Duration(seconds: 20),
+          ),
+          description: '',
+          parts: const [_third],
+        );
+        final initial = registry.capture(
+          scope: 'guest',
+          sessionEpoch: 0,
+          items: [WatchLaterQueueItem(video: a.summary)],
+          profileSource: const ProfileVideoQueueSource(
+            userId: UserId('7'),
+            name: 'UP',
+            order: 'click',
+          ),
+        )!;
+        final queue = initial.withPages([
+          PlaybackQueuePage(
+            page: 2,
+            items: [WatchLaterQueueItem(video: b.summary)],
+            hasMore: false,
+          ),
+        ]);
+        registry.update(queue);
+        final settings = ValueNotifier(
+          AppSettings(
+            playbackMode: PlaybackMode.listLoop,
+            danmakuEnabled: false,
+          ),
+        );
+        addTearDown(settings.dispose);
+        final current = ValueNotifier(_b);
+        var advances = 0;
+        addTearDown(current.dispose);
+        await tester.pumpWidget(
+          ProviderScope(
+            overrides: [
+              playbackSessionProvider.overrideWithValue(session),
+              authControllerProvider.overrideWith(_Auth.new),
+              watchLaterQueueRegistryProvider.overrideWithValue(registry),
+              profileRepositoryProvider.overrideWithValue(repository),
+              for (final video in [a, b, other]) ...[
+                videoDetailProvider(video.summary.id)
+                    .overrideWith((_) => video),
+                relatedVideosProvider(video.summary.id)
+                    .overrideWith((_) => const []),
+                videoTagsProvider(video.summary.id)
+                    .overrideWith((_) => const []),
+              ],
+            ],
+            child: MaterialApp(
+              home: Scaffold(
+                body: ValueListenableBuilder(
+                  valueListenable: settings,
+                  builder: (_, value, _) => ValueListenableBuilder(
+                    valueListenable: current,
+                    builder: (_, id, _) => VideoScreen(
+                      id: id,
+                      queue: queue,
+                      onOpenQueueVideo: (id) {
+                        advances++;
+                        current.value = id;
+                      },
+                      playerBuilder: (_, detail, part) => PlaybackPanel(
+                        detail: detail,
+                        part: part,
+                        settings: value,
+                        window: _Window(),
+                        onToggleComments: () {},
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        );
+        await _frames(tester);
+        engine.end();
+        await _frames(tester);
+        expect(repository.calls, 1);
+        final retry = find.widgetWithText(TextButton, '重试');
+        await tester.ensureVisible(retry);
+        await _frames(tester);
+        expect(tester.widget<TextButton>(retry).onPressed, isNotNull);
+        expect(session.detail?.summary.id, _b);
+        if (cancel == 'mode') {
+          settings.value = settings.value.copyWith(
+            playbackMode: PlaybackMode.pause,
+          );
+        }
+        if (cancel == 'mode_restore') {
+          settings.value = settings.value.copyWith(
+            playbackMode: PlaybackMode.pause,
+          );
+          await _frames(tester);
+          settings.value = settings.value.copyWith(
+            playbackMode: PlaybackMode.listLoop,
+          );
+        }
+        if (cancel == 'source') current.value = c;
+        await _frames(tester);
+        repository.failure = false;
+        final opens = engine.opens;
+        await tester.tap(retry);
+        await _frames(tester);
+        expect(repository.calls, 2);
+        expect(
+          session.detail?.summary.id,
+          cancel == 'none'
+              ? _a
+              : cancel == 'source'
+              ? c
+              : _b,
+        );
+        expect(engine.opens, opens + (cancel == 'none' ? 1 : 0));
+        expect(advances, cancel == 'none' ? 1 : 0);
+        expect(tester.takeException(), isNull);
+        await tester.pumpWidget(const SizedBox.shrink());
+        await _frames(tester);
+      },
+    );
+  }
+}
+
+class _ProfileQueueRepo extends Fake implements ProfileRepository {
+  bool failure = true;
+  int calls = 0;
+  @override
+  String get accountScope => 'guest';
+  @override
+  int get sessionEpoch => 0;
+  @override
+  Future<ProfilePage> loadEntries(
+    UserId id,
+    ProfileSection section, {
+    required int page,
+    String? cursor,
+    String order = 'pubdate',
+    String keyword = '',
+    String? folderId,
+    ProfileCollectionId? collection,
+    required RequestCancellation cancellation,
+  }) async {
+    calls++;
+    if (failure) throw const AppFailure(AppFailureKind.network, '首页加载失败');
+    return ProfilePage(
+      items: [
+        ProfileEntry(
+          id: _a.value,
+          kind: ProfileEntryKind.video,
+          title: 'A',
+          video: _video(_a, _parts).summary,
+        ),
+      ],
+      hasMore: false,
+    );
+  }
+}
+
+Future<void> _frames(WidgetTester tester) async {
+  for (var i = 0; i < 12; i++) {
+    await tester.pump(const Duration(milliseconds: 16));
+  }
+}
+
+PlaybackSession _session(
+  _Engine engine, {
+  int Function()? epoch,
+  _PlaybackRepo? repository,
+  DateTime Function()? now,
+}) => PlaybackSession(
+  engine: engine,
+  repository: repository ?? _PlaybackRepo(),
+  contentRepository: _ContentRepo(),
+  progress: _Progress(),
+  accountScope: () => 'guest',
+  sessionEpoch: epoch,
+  danmakuNow: () => Duration.zero,
+  sleepTimerNow: now,
+);
+
+class _Engine extends CardFakeEngine {
+  Completer<void>? seeking;
+  PlayerFailure? seekFailure;
+  int playCommands = 0;
+  @override
+  Future<void> seek(Duration target) async {
+    final failure = seekFailure;
+    await seeking?.future;
+    if (failure != null) throw failure;
+    await super.seek(target);
+  }
+
+  void end() => publish(
+    snapshot.copyWith(
+      phase: PlaybackPhase.ended,
+      position: const Duration(seconds: 20),
+      desiredPlaying: false,
+    ),
+  );
+  @override
+  Future<void> play() async {
+    playCommands++;
+    publish(
+      snapshot.copyWith(phase: PlaybackPhase.playing, desiredPlaying: true),
+    );
+  }
+
+  @override
+  Future<void> pause() async => publish(
+    snapshot.copyWith(phase: PlaybackPhase.paused, desiredPlaying: false),
+  );
+  @override
+  Future<void> setRate(double value) async =>
+      publish(snapshot.copyWith(rate: value));
+  @override
+  Future<void> setVolume(double value) async =>
+      publish(snapshot.copyWith(volume: value));
+}
+
+class _PlaybackRepo extends Fake implements PlaybackRepository {
+  final commentRequests = <String>[];
+  @override
+  Future<PlaybackMedia> resolve(
+    VideoId video,
+    String cid, {
+    required int quality,
+    VideoCodecPreference preferredCodec = VideoCodecPreference.h264,
+    required RequestCancellation cancellation,
+  }) async => cardPreviewMedia();
+  @override
+  Future<List<TimedComment>> comments(
+    String cid,
+    int segment, {
+    required RequestCancellation cancellation,
+  }) async {
+    commentRequests.add('$cid:$segment');
+    return [
+      for (final (id, second) in [('expired', 0), ('current', 9)])
+        TimedComment(
+          id: id,
+          position: Duration(seconds: second),
+          text: id,
+          mode: 1,
+          color: 0xffffff,
+          fontSize: 24,
+        ),
+    ];
+  }
+
+  @override
+  Future<List<SubtitleTrack>> subtitles(
+    VideoId video,
+    String cid, {
+    required RequestCancellation cancellation,
+  }) async => [];
+}
+
+class _ContentRepo extends Fake implements ContentPlaybackRepository {
+  @override
+  Future<PlaybackMedia> resolve(
+    ContentPlaybackTarget target, {
+    required int quality,
+    VideoCodecPreference preferredCodec = VideoCodecPreference.h264,
+    required RequestCancellation cancellation,
+  }) async => cardPreviewMedia();
+}
+
+class _Progress extends Fake implements PlaybackProgressStore {
+  @override
+  Future<Duration?> read(String scope, VideoId video, String cid) async =>
+      const Duration(seconds: 8);
+  @override
+  Future<void> write(
+    String scope,
+    VideoSummary video,
+    VideoPart part,
+    Duration position,
+    Duration duration, {
+    String? episodeId,
+  }) async {}
+}
+
+class _Window extends WindowService {
+  bool fullscreen = false;
+  @override
+  bool get supportsBackgroundAudio => true;
+  @override
+  Future<void> setFullScreen(
+    bool value, {
+    FullScreenOrientation? orientation,
+  }) async {
+    fullscreen = value;
+  }
+}
+
+class _Auth extends AuthController {
+  @override
+  AuthState build() => const AuthState();
+}
+
+class _PgcRepo extends Fake implements PgcRepository {
+  @override
+  String get accountScope => 'guest';
+  @override
+  int get sessionEpoch => 0;
+  @override
+  Future<PgcSeason> detail({
+    PgcSeasonId? seasonId,
+    PgcEpisodeId? episodeId,
+    bool refresh = false,
+    required RequestCancellation cancellation,
+  }) async => _season;
+}

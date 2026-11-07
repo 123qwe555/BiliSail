@@ -1,0 +1,128 @@
+import 'package:bili_api/bili_api.dart';
+
+import '../../../domain/app_failure.dart';
+import '../../../domain/audio_normalization.dart';
+import '../../../domain/media_cdn.dart';
+import '../../../domain/audio_quality.dart';
+import '../domain/playback_repository.dart';
+
+/// Quality takes priority; a missing preferred codec does not downgrade it.
+PlaybackMedia selectDashMedia(
+  ApiPlayInfo info, {
+  required int quality,
+  required VideoCodecPreference preferredCodec,
+  required Map<String, String> headers,
+  MediaCdnPreference cdnPreference = MediaCdnPreference.automatic,
+  bool videoOnly = false,
+  AudioQualityPreference audioQuality = AudioQualityPreference.aac192,
+}) {
+  final videos =
+      info.dashVideo
+          .where(
+            (track) => VideoCodecPreference.fromCodec(track.codecs) != null,
+          )
+          .toList()
+        ..sort((a, b) => b.id.compareTo(a.id));
+  final audios =
+      info.dashAudio
+          .where(
+            (track) =>
+                AudioQualityPreference.identify(track.id, track.codecs) != null,
+          )
+          .toList()
+        ..sort((a, b) {
+          final order = audioQuality.fallbackOrder;
+          final rank = order
+              .indexWhere(
+                (quality) =>
+                    quality == AudioQualityPreference.identify(a.id, a.codecs),
+              )
+              .compareTo(
+                order.indexWhere(
+                  (quality) =>
+                      quality ==
+                      AudioQualityPreference.identify(b.id, b.codecs),
+                ),
+              );
+          return rank != 0 ? rank : b.bandwidth.compareTo(a.bandwidth);
+        });
+  if (videos.isEmpty || !videoOnly && audios.isEmpty) {
+    throw AppFailure(
+      AppFailureKind.playback,
+      videoOnly ? '未取得可用的预览视频轨道' : '未取得可用的视频和音频轨道',
+    );
+  }
+  final selectedQuality =
+      (videos.where((track) => track.id <= quality).firstOrNull ?? videos.last)
+          .id;
+  final candidates = videos
+      .where((track) => track.id == selectedQuality)
+      .toList();
+  final order = {preferredCodec, ...VideoCodecPreference.values}.toList();
+  candidates.sort((a, b) {
+    final codecOrder = order
+        .indexWhere(
+          (codec) => codec == VideoCodecPreference.fromCodec(a.codecs),
+        )
+        .compareTo(
+          order.indexWhere(
+            (codec) => codec == VideoCodecPreference.fromCodec(b.codecs),
+          ),
+        );
+    return codecOrder != 0 ? codecOrder : b.bandwidth.compareTo(a.bandwidth);
+  });
+  PlaybackTrack map(ApiMediaTrack track) => PlaybackTrack(
+    urls: orderMediaCdnUrls([track.url, ...track.backupUrls], cdnPreference),
+    codec: track.codecs,
+    bandwidth: track.bandwidth,
+  );
+  PlaybackVoice mapVoice(ApiPlaybackVoice voice) => PlaybackVoice(
+    languageCode: voice.languageCode,
+    label: voice.label,
+    productionType: voice.productionType,
+    subtitleLanguage: voice.subtitleLanguage,
+    videoDetext: voice.videoDetext,
+    videoMouthShapeChange: voice.videoMouthShapeChange,
+  );
+  final voices = List<PlaybackVoice>.unmodifiable(info.voices.map(mapVoice));
+  final audioTracks = <PlaybackAudioTrack>[];
+  if (!videoOnly) {
+    for (final track in audios) {
+      final quality = AudioQualityPreference.identify(track.id, track.codecs);
+      if (quality != null &&
+          !audioTracks.any((option) => option.quality == quality)) {
+        audioTracks.add(
+          PlaybackAudioTrack(quality: quality, track: map(track)),
+        );
+      }
+    }
+  }
+  final loudness = videoOnly ? null : info.loudness;
+  return PlaybackMedia(
+    loudness: loudness == null
+        ? null
+        : AudioLoudness(
+            measuredI: loudness.measuredI,
+            normalTargetI: loudness.normalTargetI,
+            highDynamicTargetI: loudness.highDynamicTargetI,
+            undersizedTargetI: loudness.undersizedTargetI,
+          ),
+    video: map(candidates.first),
+    audio: audioTracks.firstOrNull?.track,
+    audioTracks: List.unmodifiable(audioTracks),
+    quality: selectedQuality,
+    qualities: videos.map((track) => track.id).toSet().toList()..sort(),
+    duration: info.duration,
+    headers: headers,
+    voices: voices,
+    voice:
+        voices
+            .where(
+              (voice) =>
+                  voice.languageCode == info.currentLanguage &&
+                  voice.productionType == info.productionType,
+            )
+            .firstOrNull ??
+        const PlaybackVoice.original(),
+  );
+}
