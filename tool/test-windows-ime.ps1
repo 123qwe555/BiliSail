@@ -1,4 +1,4 @@
-param([switch]$NativeOnly, [switch]$RealImeProfiles)
+﻿param([switch]$NativeOnly, [switch]$RealImeProfiles)
 $ErrorActionPreference = 'Stop'
 $repoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $output = Join-Path $repoRoot 'build/ime-test'

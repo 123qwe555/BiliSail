@@ -1,4 +1,4 @@
-param(
+﻿param(
   [Parameter(Mandatory)][string]$Wix,
   [Parameter(Mandatory)][string]$Msi,
   [Parameter(Mandatory)][string]$Bundle,

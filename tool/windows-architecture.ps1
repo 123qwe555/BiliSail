@@ -1,4 +1,4 @@
-# Check actual PE headers before signing or publishing a Windows payload.
+﻿# Check actual PE headers before signing or publishing a Windows payload.
 function Get-WindowsBinaryArchitecture([string]$Path) {
   $reader = [IO.BinaryReader]::new([IO.File]::OpenRead($Path))
   try {

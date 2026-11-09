@@ -1,4 +1,4 @@
-param(
+﻿param(
   [switch]$SkipBuild,
   [switch]$Maximized,
   [string]$Output = 'build/validation/window-open/results.json'

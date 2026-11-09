@@ -1,4 +1,4 @@
-param(
+﻿param(
   [Parameter(Mandatory)][string]$Executable,
   [Parameter(Mandatory)][ValidateSet('startup', 'write', 'read-delete', 'verify-deleted', 'cleanup')][string]$Phase,
   [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{32}$')][string]$RunId,

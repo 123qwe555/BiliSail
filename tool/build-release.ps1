@@ -1,4 +1,4 @@
-param(
+﻿param(
   [Parameter(Mandatory)][ValidateSet('android-arm64', 'windows-x64', 'windows-arm64', 'macos-arm64', 'macos-x64', 'ios-arm64', 'linux-x64')][string]$Target,
   [Parameter(Mandatory)][string]$Version,
   [switch]$AndroidPreviewSigning

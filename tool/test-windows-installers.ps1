@@ -1,4 +1,4 @@
-$ErrorActionPreference = 'Stop'
+﻿$ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'windows-installers.ps1')
 
 # MSI's three-field comparison must preserve Flutter's patch and build ordering.

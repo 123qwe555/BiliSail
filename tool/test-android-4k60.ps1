@@ -1,4 +1,4 @@
-param(
+﻿param(
   [Parameter(Mandatory)][string]$DeviceId,
   [Parameter(Mandatory)][string]$ConfigPath,
   [Parameter(Mandatory)][ValidatePattern('^[a-z0-9_-]+$')][string]$Label,

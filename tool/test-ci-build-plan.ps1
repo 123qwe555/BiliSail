@@ -1,4 +1,4 @@
-$ErrorActionPreference = 'Stop'
+﻿$ErrorActionPreference = 'Stop'
 $checks = 0
 $outputFile = [System.IO.Path]::GetTempFileName()
 $names = @('GITHUB_OUTPUT', 'REQUESTED_VERSION', 'ENABLE_ANDROID', 'ENABLE_WINDOWS', 'ENABLE_MACOS', 'ENABLE_IOS', 'ENABLE_LINUX', 'BUILD_TARGETS')

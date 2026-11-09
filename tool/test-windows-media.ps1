@@ -1,4 +1,4 @@
-param([switch]$Online, [switch]$InteractiveDesktop)
+﻿param([switch]$Online, [switch]$InteractiveDesktop)
 $ErrorActionPreference = 'Stop'
 $previousSystemMediaScript = $env:BILI_TEST_SYSTEM_MEDIA_SCRIPT
 Push-Location (Join-Path $PSScriptRoot '..')

@@ -1,4 +1,4 @@
-param([switch]$Integration)
+﻿param([switch]$Integration)
 $ErrorActionPreference = 'Stop'
 $repoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $output = Join-Path $repoRoot 'build/window-size-test'

@@ -1,4 +1,4 @@
-param(
+﻿param(
   [Parameter(Mandatory)]
   [ValidatePattern('^[A-Za-z0-9_-]+$')][string]$Label,
   [ValidateSet(720, 1080)][int]$Height = 720,

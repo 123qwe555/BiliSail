@@ -1,4 +1,4 @@
-param([switch]$Online, [string]$PgcEpisodeId, [switch]$SavedSession)
+﻿param([switch]$Online, [string]$PgcEpisodeId, [switch]$SavedSession)
 $ErrorActionPreference = 'Stop'
 $repoRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 Push-Location $repoRoot

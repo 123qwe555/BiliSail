@@ -1,4 +1,4 @@
-param(
+﻿param(
   [Parameter(Mandatory)][string]$Wix,
   [Parameter(Mandatory)][string]$WorkingDirectory,
   [ValidateSet('perMachine', 'perUser')][string]$Scope = 'perMachine',

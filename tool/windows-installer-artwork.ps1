@@ -1,4 +1,4 @@
-# Build installer artwork from the existing app icon; no downloaded assets or fonts.
+﻿# Build installer artwork from the existing app icon; no downloaded assets or fonts.
 function New-WindowsInstallerArtwork([string]$Destination) {
   Add-Type -AssemblyName System.Drawing
   New-Item -ItemType Directory -Path $Destination -Force | Out-Null

@@ -1,4 +1,4 @@
-# Public identity confirmed in Microsoft Partner Center. Never derive it from
+﻿# Public identity confirmed in Microsoft Partner Center. Never derive it from
 # a signing certificate or an environment override.
 function Confirm-WindowsMsixIdentity([xml]$Manifest, [string]$Version, [ValidateSet('x64', 'arm64')][string]$Architecture = 'x64') {
   $identity = $Manifest.Package.Identity

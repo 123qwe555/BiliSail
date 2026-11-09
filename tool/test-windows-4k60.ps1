@@ -1,4 +1,4 @@
-param(
+﻿param(
   [Parameter(Mandatory)][ValidatePattern('^[A-Za-z0-9_-]+$')][string]$Label,
   [string]$MediaPath,
   [string]$ExePath = 'build/windows/x64/runner/Profile/bilisail.exe',

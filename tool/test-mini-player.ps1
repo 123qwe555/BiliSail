@@ -1,4 +1,4 @@
-param([string]$DeviceId, [switch]$SkipMuxBuild)
+﻿param([string]$DeviceId, [switch]$SkipMuxBuild)
 $ErrorActionPreference = 'Stop'
 $repoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 . (Join-Path $PSScriptRoot 'android-development.ps1')

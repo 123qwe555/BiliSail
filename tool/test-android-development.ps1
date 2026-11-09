@@ -1,4 +1,4 @@
-$ErrorActionPreference = 'Stop'
+﻿$ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'android-development.ps1')
 $checks = 0
 function Assert-DevelopmentRejected([string]$Report, [string]$Mode = 'Release') {

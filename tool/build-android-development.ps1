@@ -1,11 +1,13 @@
-param(
+﻿param(
   [ValidateSet('Release', 'Profile', 'Debug')]
   [string]$Mode = 'Release',
   [switch]$Install,
   [string]$DeviceId,
   [switch]$SkipMuxBuild
 )
-$ErrorActionPreference = 'Stop'
+# PS 5.1 turns native stderr lines (javac warnings) into terminating errors
+# while Stop is active; use Continue and rely on $LASTEXITCODE for failures.
+$ErrorActionPreference = 'Continue'
 $repoRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 . (Join-Path $PSScriptRoot 'android-development.ps1')
 . (Join-Path $PSScriptRoot 'android-signing.ps1')

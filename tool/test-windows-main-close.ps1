@@ -1,4 +1,4 @@
-param()
+﻿param()
 $ErrorActionPreference = 'Stop'
 $previousMediaDirectory = $env:BILI_TEST_MEDIA_DIR
 Push-Location (Join-Path $PSScriptRoot '..')

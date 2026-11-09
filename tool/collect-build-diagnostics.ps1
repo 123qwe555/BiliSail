@@ -1,4 +1,4 @@
-param([string]$Destination = 'artifacts/windows-x64/diagnostics')
+﻿param([string]$Destination = 'artifacts/windows-x64/diagnostics')
 $ErrorActionPreference = 'Stop'
 $repoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $output = [IO.Path]::GetFullPath((Join-Path $repoRoot $Destination))

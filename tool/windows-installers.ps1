@@ -1,4 +1,4 @@
-# WiX is a build-time dependency; the native Burn UI needs no .NET on users' PCs.
+﻿# WiX is a build-time dependency; the native Burn UI needs no .NET on users' PCs.
 $script:WindowsWixVersion = '6.0.2'
 $script:WindowsPackagingRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../windows/packaging'))
 . (Join-Path $PSScriptRoot 'windows-installer-artwork.ps1')

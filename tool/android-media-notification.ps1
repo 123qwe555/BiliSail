@@ -1,4 +1,4 @@
-# audio_service resolves these icons by name. Dart references are invisible to
+﻿# audio_service resolves these icons by name. Dart references are invisible to
 # Android's resource shrinker, so validate the compiled APK before distribution.
 function Assert-AndroidMediaNotificationResources([string]$Report) {
   foreach ($name in @('ic_media_notification', 'audio_service_play_arrow', 'audio_service_pause', 'audio_service_stop', 'ic_media_rewind_10', 'ic_media_forward_10')) {

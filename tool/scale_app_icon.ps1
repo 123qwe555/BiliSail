@@ -1,4 +1,4 @@
-# Keep the selected artwork and canvas; regenerate the 10% enlargement on Windows.
+﻿# Keep the selected artwork and canvas; regenerate the 10% enlargement on Windows.
 $ErrorActionPreference = 'Stop'
 $repoRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 Add-Type -AssemblyName System.Drawing

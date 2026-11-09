@@ -1,4 +1,4 @@
-param(
+﻿param(
   [switch]$SkipPub,
   [switch]$EnforceLockfile,
   [ValidateSet('All', 'Lint', 'RootTests', 'PackageTests')]

@@ -1,4 +1,4 @@
-# Local device validation must use this identity across every build mode.
+﻿# Local device validation must use this identity across every build mode.
 $AndroidDevelopmentPackageId = 'dev.bilisail.bilisail.test'
 $AndroidDevelopmentDisplayName = 'BiliSail 测试版'
 $AndroidDevelopmentBuildArgument = '--android-project-arg=bilisailDevelopmentBuild=true'

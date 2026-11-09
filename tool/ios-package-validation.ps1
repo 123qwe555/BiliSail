@@ -1,4 +1,4 @@
-# Shared by the staged .app and final IPA checks; also runs without Xcode.
+﻿# Shared by the staged .app and final IPA checks; also runs without Xcode.
 function Confirm-IosMuxFrameworkEntries([string[]]$Entries) {
   foreach ($entry in $Entries) {
     if ($entry -match '^(Resources|Versions)(/|$)') {

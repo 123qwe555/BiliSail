@@ -1,4 +1,4 @@
-# Shared by packaging and its offline signing-boundary checks.
+﻿# Shared by packaging and its offline signing-boundary checks.
 function Initialize-AndroidSigning([switch]$Preview) {
   $signingValues = @(
     $env:ANDROID_KEYSTORE_BASE64, $env:ANDROID_KEYSTORE_PATH,
@@ -97,7 +97,8 @@ function Confirm-AndroidApkSigning([string]$Package, $State) {
     $certificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($certificateBytes)
   } catch { throw 'Invalid APK signing certificate.' }
   try {
-    $sha256 = [Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData($certificate.RawData)).ToLowerInvariant()
+    $hashBytes = [System.Security.Cryptography.SHA256]::Create().ComputeHash($certificate.RawData)
+    $sha256 = [System.BitConverter]::ToString($hashBytes).Replace('-', '').ToLowerInvariant()
   } finally { $certificate.Dispose() }
   if ($State.Signing -eq 'configured-keystore' -and $sha256 -ne $State.ExpectedSha256.ToLowerInvariant()) {
     throw 'APK signing certificate does not match ANDROID_SIGNING_CERTIFICATE_SHA256.'

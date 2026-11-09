@@ -1,4 +1,4 @@
-# The official Flutter checkout supports bootstrapping native ARM64 Dart even
+﻿# The official Flutter checkout supports bootstrapping native ARM64 Dart even
 # when flutter-action initially selects the Windows x64 distribution.
 $ErrorActionPreference = 'Stop'
 if (!$IsWindows -or [Runtime.InteropServices.RuntimeInformation]::OSArchitecture -ne 'Arm64') {

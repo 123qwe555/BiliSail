@@ -1,4 +1,4 @@
-param([ValidatePattern('^[A-Za-z0-9_-]+$')][string]$Label = 'current')
+﻿param([ValidatePattern('^[A-Za-z0-9_-]+$')][string]$Label = 'current')
 $ErrorActionPreference = 'Stop'
 $repoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $mediaDir = Join-Path $repoRoot 'build/validation/preview-contention-media'

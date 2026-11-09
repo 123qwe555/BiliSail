@@ -1,4 +1,4 @@
-# Shared by CI preparation, packaging and offline version-boundary checks.
+﻿# Shared by CI preparation, packaging and offline version-boundary checks.
 function Get-AndroidVersionCode([string]$Version) {
   if ($Version -cnotmatch '^(0|[1-9][0-9]*)\.([0-9])\.([0-9])\+(0|[1-9][0-9]?)$') {
     throw 'Android version must be major.minor.patch+build: minor/patch 0..9, build 0..99.'

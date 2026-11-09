@@ -1,4 +1,4 @@
-param(
+﻿param(
   [ValidateSet('x64', 'arm64')][string]$Architecture = 'x64',
   [string]$ArchiveDirectory = (Join-Path $PSScriptRoot "../build/windows/$Architecture")
 )

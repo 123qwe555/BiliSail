@@ -1,4 +1,4 @@
-param([Parameter(Mandatory)][string]$DeviceId, [switch]$SkipReleaseBuild)
+﻿param([Parameter(Mandatory)][string]$DeviceId, [switch]$SkipReleaseBuild)
 $ErrorActionPreference = 'Stop'
 $repoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 . (Join-Path $PSScriptRoot 'android-development.ps1')

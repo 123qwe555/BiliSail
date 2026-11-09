@@ -1,4 +1,4 @@
-param()
+﻿param()
 $ErrorActionPreference = 'Stop'
 $previousMedia = $env:BILI_TEST_MEDIA_DIR
 $previousLive = $env:BILI_FVP_LIVE_MEDIA_DIR

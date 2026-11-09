@@ -1,4 +1,4 @@
-param(
+﻿param(
   [ValidateSet('Read', 'Play', 'Pause', 'Seek', 'Stop', 'Absent')]
   [string]$Action = 'Read',
   [string]$Title = 'BiliSail system media fixture',

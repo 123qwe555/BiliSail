@@ -1,4 +1,4 @@
-param(
+﻿param(
   [Parameter(Mandatory)]
   [string]$DeviceId,
   [ValidatePattern('^[a-z0-9-]+$')]

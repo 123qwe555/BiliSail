@@ -1,4 +1,4 @@
-param(
+﻿param(
   [Parameter(Mandatory)][string]$DeviceId,
   [switch]$PrepareSample,
   [switch]$SkipMuxBuild

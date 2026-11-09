@@ -1,4 +1,4 @@
-function Initialize-DolbyVisionFixture([string]$Fixtures) {
+﻿function Initialize-DolbyVisionFixture([string]$Fixtures) {
   $sourceUrl = 'https://media.developer.dolby.com/DolbyVision_Atmos/mp4/iOS_P5_GlassBlowing2_1920x1080%4059.94fps_15200kbps.mp4'
   $prefixHash = '2e1a62c39519ccef267353672aff6c2985b7ef145739fb60b56029fa91ec6fac'
   New-Item -ItemType Directory -Force -Path $Fixtures | Out-Null

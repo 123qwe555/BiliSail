@@ -1,4 +1,4 @@
-$ErrorActionPreference = 'Stop'
+﻿$ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'android-version.ps1')
 $checks = 0
 function Assert-Code([string]$Version, [int]$Expected) {

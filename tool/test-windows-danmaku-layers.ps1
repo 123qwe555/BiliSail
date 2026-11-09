@@ -1,4 +1,4 @@
-param(
+﻿param(
   [Parameter(Mandatory)][ValidatePattern('^[A-Za-z0-9_-]+$')][string]$Label,
   [Parameter(Mandatory)][string]$BeforeExe,
   [Parameter(Mandatory)][string]$AfterExe,

@@ -1,4 +1,4 @@
-# Native, static-CRT UI helper shared by MSI and Burn. SDKs are build-only.
+﻿# Native, static-CRT UI helper shared by MSI and Burn. SDKs are build-only.
 function Build-WindowsInstallerNative([string]$WorkingDirectory, [ValidateSet('x64', 'arm64')][string]$Architecture = 'x64') {
   if (!$IsWindows) { throw 'Installer native UI requires Windows.' }
   $sdk = Join-Path $WorkingDirectory 'sdk'

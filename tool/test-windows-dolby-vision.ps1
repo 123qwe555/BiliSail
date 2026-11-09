@@ -1,4 +1,4 @@
-param([switch]$PrepareSample, [switch]$WithoutVulkan)
+﻿param([switch]$PrepareSample, [switch]$WithoutVulkan)
 $ErrorActionPreference = 'Stop'
 $repoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $fixtures = Join-Path $repoRoot 'build/validation/dolby-vision'

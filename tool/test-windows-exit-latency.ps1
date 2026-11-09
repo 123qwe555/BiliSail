@@ -1,4 +1,4 @@
-param(
+﻿param(
   [int]$Samples = 3,
   [int]$StartupSeconds = 3,
   [int]$MaxExitMilliseconds = 2000,

@@ -1,4 +1,4 @@
-$ErrorActionPreference = 'Stop'
+﻿$ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'windows-msix-identity.ps1')
 [xml]$manifest = Get-Content (Join-Path $PSScriptRoot '../windows/packaging/AppxManifest.xml') -Raw
 $manifest.Package.Identity.Version = '1.0.2.0'

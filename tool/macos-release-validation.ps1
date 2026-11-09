@@ -1,4 +1,4 @@
-# This helper is also loaded by offline boundary tests on Windows/Linux.
+﻿# This helper is also loaded by offline boundary tests on Windows/Linux.
 function Confirm-MacOSReleaseEntitlements([string]$EntitlementsXml) {
   $document = [System.Xml.XmlDocument]::new()
   $document.XmlResolver = $null
