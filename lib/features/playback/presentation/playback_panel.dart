@@ -14,12 +14,15 @@ import '../../../core/presentation/workspace_activity.dart';
 import '../../../core/presentation/android_system_ui.dart';
 import '../../../core/presentation/mobile_playback_status_bar.dart';
 import '../../../shared/ui/playback_page_commands.dart';
+import '../../../shared/ui/apple_design.dart';
 import '../../../shared/ui/playback_navigation.dart';
 import '../../../shared/ui/width_layout_builder.dart';
 import '../../../shared/ui/app_dialog.dart';
 import '../../../shared/ui/danmaku_composer_draft.dart';
 import '../../../shared/ui/player_controls_menu_scope.dart';
 import '../../../shared/ui/smooth_scroll_behavior.dart';
+import '../../../shared/ui/fullscreen_reveal.dart';
+import '../../../shared/ui/video_open_transition.dart';
 import '../../../domain/video.dart';
 import '../../settings/domain/app_settings.dart';
 import '../../../core/input/shortcut_dispatcher.dart';
@@ -94,6 +97,10 @@ class _PlaybackPanelState extends ConsumerState<PlaybackPanel>
   late int _pictureGeneration;
   bool _fullScreen = false;
   bool _miniPlayer = false;
+
+  /// One automatic fullscreen per page: leaving it by hand must not be undone
+  /// by the next activation, and coming back to the page must not re-enter.
+  bool _autoFullScreenHandled = false;
   bool _systemPip = false;
   OverlayEntry? _miniOverlay;
   Object? _miniRequest;
@@ -105,6 +112,44 @@ class _PlaybackPanelState extends ConsumerState<PlaybackPanel>
   _PlayerFullScreenRoute<void>? _fullScreenRoute;
   NavigatorState? _fullScreenNavigator;
   Object? _fullScreenRequest;
+
+  /// Measures the inline player so the fullscreen flight can start and end on
+  /// the surface the user is actually looking at.
+  final GlobalKey _inlineSurfaceKey = GlobalKey();
+
+  /// Where the expand flight starts. Set by the card tap path so a video that
+  /// opens straight into fullscreen grows out of its own thumbnail instead of
+  /// out of the player slot it never visibly occupied.
+  Rect? _fullScreenFlightFrom;
+
+  /// Cover captured on the way out of fullscreen, replayed once the browsing
+  /// layout is back so the collapse flight starts on the right artwork.
+  String _fullScreenCloseCover = '';
+
+  /// Where the picture was before the route took over. Null on displays whose
+  /// fullscreen mode rotates the panel: the OS already animates that switch,
+  /// and stacking a second motion on a rotation reads as a stutter.
+  Rect? _revealFrom;
+  Size? _revealVideoSize;
+
+  /// True while this session entered fullscreen with the animated flight, so
+  /// exiting knows to land the picture and hold the black exit cover back.
+  bool _revealActive = false;
+
+  /// The entrance flight, kept so the exit can start the picture exactly where
+  /// it was left.
+  FullScreenFlight? _revealFlight;
+
+  /// Armed on exit: the inline surface is painted at fullscreen size for its
+  /// first frame and collapses into its slot from there.
+  ///
+  /// The wrapper is mounted for the whole life of the page, even when idle,
+  /// because turning it on later would rebuild the player surface — and a
+  /// surface that is torn down and rebuilt is exactly the flash this is meant
+  /// to remove. A new generation restarts the flight on the next exit.
+  int _landingGeneration = 0;
+  double _landingScale = 1;
+  Offset _landingTravel = Offset.zero;
   Completer<void>? _browseLayoutReady;
   FullScreenOrientation? _fullScreenOrientation;
   StreamSubscription<FullScreenOrientation?>? _deviceOrientationSubscription;
@@ -190,16 +235,7 @@ class _PlaybackPanelState extends ConsumerState<PlaybackPanel>
       if (!mounted || !identical(_activityRequest, activityRequest)) return;
       if (active) {
         _configure();
-        unawaited(
-          _session.activate(
-            this,
-            widget.detail,
-            widget.part,
-            target: widget.target,
-            title: widget.title,
-            visible: _active,
-          ),
-        );
+        unawaited(_activateForActivity(activityRequest));
         // Give an outgoing inline or fullscreen surface a frame to unmount.
         WidgetsBinding.instance.scheduleFrame();
         await WidgetsBinding.instance.endOfFrame;
@@ -207,6 +243,7 @@ class _PlaybackPanelState extends ConsumerState<PlaybackPanel>
             _active &&
             identical(_activityRequest, activityRequest)) {
           setState(() => _surfaceReady = true);
+          _maybeAutoFullScreen(activityRequest);
         }
       } else {
         unawaited(_session.deactivate(this));
@@ -215,6 +252,70 @@ class _PlaybackPanelState extends ConsumerState<PlaybackPanel>
   }
 
   void _configure() => _session.configureSettings(widget.settings);
+
+  /// Opens the source now but starts the picture only once the card has landed.
+  ///
+  /// Resolving media early is what keeps the gap between the animation and the
+  /// first frame short; playing early would run the video underneath the
+  /// cover, which is the one thing the transition exists to hide.
+  Future<void> _activateForActivity(Object activityRequest) async {
+    final gate = VideoOpenGate.busy ? VideoOpenGate.settled : null;
+    await _session.activate(
+      this,
+      widget.detail,
+      widget.part,
+      target: widget.target,
+      title: widget.title,
+      visible: _active,
+      desiredPlaying: gate == null ? null : false,
+    );
+    if (gate == null) return;
+    await gate;
+    if (!mounted ||
+        !_active ||
+        !identical(_activityRequest, activityRequest) ||
+        !_session.ownsPlayback(this)) {
+      return;
+    }
+    // The gate only delays the start: it never overrules the user's autoplay
+    // choice, nor resumes something they paused or that already ended.
+    if (!_settings.value.autoPlay) return;
+    final phase = _session.snapshots.value.phase;
+    if (phase == PlaybackPhase.playing ||
+        phase == PlaybackPhase.paused ||
+        phase == PlaybackPhase.ended) {
+      return;
+    }
+    unawaited(_session.play());
+  }
+
+  /// Honours "打开视频后自动全屏" the first time this page becomes active.
+  ///
+  /// Runs after the surface is ready so the player already has a size, and only
+  /// once per page instance, so exiting fullscreen stays exited.
+  void _maybeAutoFullScreen(Object activityRequest) {
+    if (_autoFullScreenHandled) return;
+    if (!_settings.value.autoFullscreenOnOpen) return;
+    if (!mounted ||
+        !_active ||
+        !identical(_activityRequest, activityRequest) ||
+        _fullScreen ||
+        _miniPlayer ||
+        // Pages without a video (live, audio-only) never enter fullscreen here;
+        // a video page that is still resolving simply retries on its next
+        // activation.
+        widget.detail == null) {
+      return;
+    }
+    // Set before entering: exiting fullscreen by hand must stay exited.
+    _autoFullScreenHandled = true;
+    // The page is still brand new, so the flight can ignore the inline player
+    // slot it never visibly occupied and grow out of the tapped thumbnail
+    // instead: one continuous push from the grid to full screen.
+    final origin = VideoOpenOrigin.lastCardRect;
+    if (origin != null) _fullScreenFlightFrom = origin;
+    unawaited(_enterFullScreen());
+  }
 
   void _onPlaybackCompleted() {
     final snapshot = _session.snapshots.value;
@@ -352,6 +453,9 @@ class _PlaybackPanelState extends ConsumerState<PlaybackPanel>
     _shortcuts.cancel();
     _portraitExitRequest = null;
     _stopDeviceOrientation();
+    _revealActive = false;
+    _revealFrom = null;
+    _revealVideoSize = null;
     final request = _fullScreenRequest;
     _fullScreenRequest = null;
     // A disposed Navigator may never complete push(). Release platform state
@@ -370,8 +474,13 @@ class _PlaybackPanelState extends ConsumerState<PlaybackPanel>
   Future<void> _exitFullScreen() async {
     if (_exitingFullScreen) return;
     _exitingFullScreen = true;
+    // The fullscreen surface still covers the view; the rectangle itself is
+    // measured after the browsing layout is back, because exiting may rotate.
+    _fullScreenCloseCover = VideoOpenOrigin.lastCover;
+    // The black exit cover exists to hide a rotation or a system-bar jump. An
+    // animated exit has neither, and the cover would swallow the collapse.
     _fullScreenExitCover.value =
-        !widget.window.hasDesktopWindow && _isPhoneDisplay;
+        !widget.window.hasDesktopWindow && _isPhoneDisplay && !_revealActive;
     _fullScreenPresented = false;
     _stopDeviceOrientation();
     try {
@@ -484,6 +593,22 @@ class _PlaybackPanelState extends ConsumerState<PlaybackPanel>
         (_isViewLandscape
             ? FullScreenOrientation.landscape
             : FullScreenOrientation.portrait);
+  }
+
+  /// Whether entering fullscreen will actually turn the display.
+  ///
+  /// A real rotation is the transition: the operating system wipes the old
+  /// layout out and the new one in, so adding our own zoom on top of it would
+  /// run two motions against each other. Displays that stay in the same
+  /// orientation (tablets already held the right way up, desktop windows) get
+  /// the animated flight instead.
+  bool get _fullScreenRotates {
+    final target = _preferredFullScreenOrientation;
+    if (target == null) return false;
+    final current = _isViewLandscape
+        ? FullScreenOrientation.landscape
+        : FullScreenOrientation.portrait;
+    return target != current;
   }
 
   bool get _isPhoneDisplay {
@@ -723,6 +848,78 @@ class _PlaybackPanelState extends ConsumerState<PlaybackPanel>
     }
   }
 
+  /// The inline player's rectangle in global coordinates, or null while the
+  /// panel is showing the fullscreen surface instead.
+  Rect? _inlineSurfaceRect() {
+    final box = _inlineSurfaceKey.currentContext?.findRenderObject();
+    if (box is! RenderBox || !box.hasSize) return null;
+    final rect = box.localToGlobal(Offset.zero) & box.size;
+    return rect.width > 0 && rect.height > 0 ? rect : null;
+  }
+
+  /// The fullscreen surface always covers the whole view, so this is the same
+  /// rectangle the route paints into.
+  Rect? _viewportRect() {
+    final view = View.maybeOf(context);
+    if (view == null) return null;
+    final ratio = view.devicePixelRatio;
+    if (ratio <= 0) return null;
+    final size = view.physicalSize / ratio;
+    return size.width > 0 && size.height > 0 ? Offset.zero & size : null;
+  }
+
+  /// Grows the tapped thumbnail into the fullscreen viewport.
+  ///
+  /// Only the card path animates. A video that was already open and is
+  /// promoted to fullscreen by hand keeps the inline slot as its origin, which
+  /// is handled by [FullScreenReveal] instead.
+  ///
+  /// Runs while the fullscreen route is still being pushed: the flight is
+  /// inserted into the root overlay and stays above the route, so the player
+  /// can mount and start decoding behind it without a single flash of the
+  /// browsing page or of the half-built player.
+  bool _playFullScreenOpenFlight() {
+    final from = _fullScreenFlightFrom;
+    _fullScreenFlightFrom = null;
+    if (from == null) return false;
+    VideoOpenOrigin.playFullScreenOpen(context, from: from);
+    return true;
+  }
+
+  /// The picture's intrinsic size, which the reveal needs in order to start
+  /// from the picture rather than from the letterbox around it.
+  Size? _sessionVideoSize() {
+    final dimensions = _session.snapshots.value.videoDimensions;
+    if (dimensions == null || dimensions.width <= 0 || dimensions.height <= 0) {
+      return null;
+    }
+    return Size(dimensions.width.toDouble(), dimensions.height.toDouble());
+  }
+
+  /// Collapses the fullscreen surface back into the inline player slot.
+  ///
+  /// Deliberately deferred to the first frame after the browsing layout is
+  /// restored: only then does the inline slot exist again, and only then is the
+  /// view the size the flight has to start from (exiting fullscreen may have
+  /// rotated the display back as well).
+  void _scheduleFullScreenCloseFlight() {
+    final cover = _fullScreenCloseCover;
+    _fullScreenCloseCover = '';
+    if (cover.isEmpty) return;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || _fullScreen || _miniPlayer) return;
+      final from = _viewportRect();
+      final to = _inlineSurfaceRect();
+      if (from == null || to == null) return;
+      VideoOpenOrigin.playFullScreenClose(
+        context,
+        from: from,
+        to: to,
+        cover: cover,
+      );
+    });
+  }
+
   Future<void> _enterFullScreen() async {
     if (_fullScreen || _miniPlayer || !_active) return;
     _shortcuts.cancel();
@@ -736,7 +933,23 @@ class _PlaybackPanelState extends ConsumerState<PlaybackPanel>
     _physicalLandscapeSeen =
         _deviceOrientation == FullScreenOrientation.landscape ||
         (!widget.window.keepsBrowsePortrait && _isViewLandscape);
+    // Measure the inline surface before it is replaced by the black fill.
+    final inlineSlot = _inlineSurfaceRect();
+    _revealVideoSize = _sessionVideoSize();
     setState(() => _fullScreen = true);
+    // A card flight already owns the entrance; otherwise the picture grows out
+    // of the slot it is leaving, unless the OS is about to rotate.
+    final covered = _playFullScreenOpenFlight();
+    _revealFrom = covered || _fullScreenRotates ? null : inlineSlot;
+    _revealActive = _revealFrom != null;
+    final viewport = _revealFrom == null ? null : _viewportRect();
+    _revealFlight = viewport == null
+        ? null
+        : FullScreenReveal.resolve(
+            from: _revealFrom!,
+            video: _revealVideoSize ?? const Size(16, 9),
+            box: viewport.size,
+          );
     _syncDeviceOrientation();
     try {
       // Unmount the inline surface before the route surface is created.
@@ -786,34 +999,39 @@ class _PlaybackPanelState extends ConsumerState<PlaybackPanel>
                 brightness: Brightness.dark,
                 child: Dialog.fullscreen(
                   backgroundColor: Colors.black,
-                  child: _PlayerView(
-                    session: _session,
-                    settings: _settings,
-                    controlsVisible: _controlsVisible,
-                    picture: _picture,
-                    shortcuts: _shortcuts,
-                    onToggleComments: () => widget.onToggleComments(),
-                    danmakuComposerBuilder:
-                        widget.danmakuComposerBuilder == null
-                        ? null
-                        : (context) => _buildDanmakuComposer(context),
-                    danmakuOverlayBuilder: widget.danmakuOverlayBuilder == null
-                        ? null
-                        : (context) =>
-                              widget.danmakuOverlayBuilder?.call(context) ??
-                              const SizedBox.shrink(),
-                    pageCommands: _pageCommands,
-                    navigation: _navigation,
-                    onNavigate: _navigateFromPlayer,
-                    fullScreen: true,
-                    onFullScreen: () {
-                      if (identical(
-                        _fullScreenRoute,
-                        ModalRoute.of(dialogContext),
-                      )) {
-                        unawaited(_exitFullScreen());
-                      }
-                    },
+                  child: FullScreenReveal(
+                    from: _revealFrom,
+                    videoSize: _revealVideoSize,
+                    child: _PlayerView(
+                      session: _session,
+                      settings: _settings,
+                      controlsVisible: _controlsVisible,
+                      picture: _picture,
+                      shortcuts: _shortcuts,
+                      onToggleComments: () => widget.onToggleComments(),
+                      danmakuComposerBuilder:
+                          widget.danmakuComposerBuilder == null
+                          ? null
+                          : (context) => _buildDanmakuComposer(context),
+                      danmakuOverlayBuilder:
+                          widget.danmakuOverlayBuilder == null
+                          ? null
+                          : (context) =>
+                                widget.danmakuOverlayBuilder?.call(context) ??
+                                const SizedBox.shrink(),
+                      pageCommands: _pageCommands,
+                      navigation: _navigation,
+                      onNavigate: _navigateFromPlayer,
+                      fullScreen: true,
+                      onFullScreen: () {
+                        if (identical(
+                          _fullScreenRoute,
+                          ModalRoute.of(dialogContext),
+                        )) {
+                          unawaited(_exitFullScreen());
+                        }
+                      },
+                    ),
                   ),
                 ),
               ),
@@ -851,10 +1069,25 @@ class _PlaybackPanelState extends ConsumerState<PlaybackPanel>
       await WidgetsBinding.instance.endOfFrame;
       await _setWindowFullScreen(request, false);
       _fullScreenOrientation = null;
+      // The next entry re-measures its origin from the layout of that moment.
+      final flight = _revealFlight;
+      // Landing only makes sense on a page the user is still looking at; a
+      // dismissed page has nothing to fly into.
+      if (_revealActive && flight != null && mounted && _active) {
+        final (scale, travel) = FullScreenLanding.invert(flight);
+        _landingGeneration++;
+        _landingScale = scale;
+        _landingTravel = travel;
+      }
+      _revealActive = false;
+      _revealFrom = null;
+      _revealVideoSize = null;
+      _revealFlight = null;
       if (mounted) {
         _fullScreenExitCover.value = false;
         setState(() => _fullScreen = false);
         _syncDeviceOrientation();
+        _scheduleFullScreenCloseFlight();
       }
     }
   }
@@ -1025,25 +1258,35 @@ class _PlaybackPanelState extends ConsumerState<PlaybackPanel>
       },
       child: _fullScreen || _miniPlayer
           ? const ColoredBox(color: Colors.black)
-          : _PlayerView(
-              session: _session,
-              settings: _settings,
-              controlsVisible: _controlsVisible,
-              picture: _picture,
-              shortcuts: _shortcuts,
-              onToggleComments: widget.onToggleComments,
-              danmakuComposerBuilder: widget.danmakuComposerBuilder == null
-                  ? null
-                  : _buildDanmakuComposer,
-              danmakuOverlayBuilder: widget.danmakuOverlayBuilder,
-              onFullScreen: _enterFullScreen,
-              pageCommands: _pageCommands,
-              navigation: _navigation,
-              onNavigate: _navigateFromPlayer,
-              fullScreen: false,
-              active: _active && _surfaceReady,
+          : KeyedSubtree(
+              key: _inlineSurfaceKey,
+              child: FullScreenLanding(
+                generation: _landingGeneration,
+                startScale: _landingScale,
+                startTravel: _landingTravel,
+                child: inlineSurface,
+              ),
             ),
     ),
+  );
+
+  Widget get inlineSurface => _PlayerView(
+    session: _session,
+    settings: _settings,
+    controlsVisible: _controlsVisible,
+    picture: _picture,
+    shortcuts: _shortcuts,
+    onToggleComments: widget.onToggleComments,
+    danmakuComposerBuilder: widget.danmakuComposerBuilder == null
+        ? null
+        : _buildDanmakuComposer,
+    danmakuOverlayBuilder: widget.danmakuOverlayBuilder,
+    onFullScreen: _enterFullScreen,
+    pageCommands: _pageCommands,
+    navigation: _navigation,
+    onNavigate: _navigateFromPlayer,
+    fullScreen: false,
+    active: _active && _surfaceReady,
   );
 
   Widget _buildDanmakuComposer(BuildContext context) {
@@ -2256,9 +2499,8 @@ class _PlayerViewState extends State<_PlayerView> with WidgetsBindingObserver {
                                                                       .duration
                                                                       .inMilliseconds)
                                                               .clamp(0, 1),
-                                                      color: const Color(
-                                                        0xffdf6589,
-                                                      ),
+                                                      color:
+                                                          ApplePalette.darkTint,
                                                       backgroundColor:
                                                           Colors.transparent,
                                                     ),
@@ -2808,9 +3050,7 @@ class _ControlBar extends StatelessWidget {
       icon: Icon(
         BiliIcons.danmaku,
         size: 20,
-        color: settings.danmakuEnabled
-            ? const Color(0xffff9ab8)
-            : Colors.white54,
+        color: settings.danmakuEnabled ? ApplePalette.darkTint : Colors.white54,
       ),
     );
     final subtitleButton = PopupMenuButton<int>(
@@ -3568,10 +3808,16 @@ ThemeData _playerControlsTheme(BuildContext context) {
     fontFamily: text?.fontFamily,
     fontFamilyFallback: text?.fontFamilyFallback,
   ).copyWith(
-    colorScheme: ColorScheme.fromSeed(
-      seedColor: const Color(0xffdf6589),
-      brightness: Brightness.dark,
-    ),
+    colorScheme:
+        ColorScheme.fromSeed(
+          seedColor: ApplePalette.darkTint,
+          brightness: Brightness.dark,
+        ).copyWith(
+          primary: ApplePalette.darkTint,
+          surface: ApplePalette.darkCard,
+          onSurface: ApplePalette.darkLabel,
+          surfaceContainer: ApplePalette.darkFill,
+        ),
   );
 }
 

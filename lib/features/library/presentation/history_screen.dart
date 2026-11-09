@@ -14,6 +14,7 @@ import '../../../shared/ui/video_grid.dart';
 import '../../../shared/ui/video_card.dart';
 import '../application/library_controller.dart';
 import '../domain/library_repository.dart';
+import '../../../shared/ui/app_layout.dart';
 
 final class HistoryScreen extends ConsumerStatefulWidget {
   const HistoryScreen({super.key, this.showHeading = true});
@@ -232,7 +233,10 @@ final class _HistoryScreenState extends ConsumerState<HistoryScreen> {
                                       const SizedBox(height: 7),
                                     ],
                                     Text(
-                                      constraints.maxWidth < 600
+                                      AppLayout.compactOf(
+                                            context,
+                                            extent: constraints.maxWidth,
+                                          )
                                           ? '云端观看记录'
                                           : '当前账号的云端观看记录',
                                       style: TextStyle(

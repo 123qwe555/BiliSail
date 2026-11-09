@@ -25,6 +25,10 @@ import 'shortcut_coordinator.dart';
 import '../features/settings/domain/shortcut_settings.dart';
 import '../features/settings/domain/settings_category.dart';
 import '../features/settings/domain/app_settings.dart';
+import '../shared/ui/app_layout.dart';
+import '../shared/ui/apple_design.dart';
+import '../shared/ui/apple_motion.dart';
+import '../shared/ui/video_open_transition.dart';
 import '../shared/ui/smooth_scroll_behavior.dart';
 import '../shared/ui/bili_icons.dart';
 import '../shared/ui/shortcut_hint.dart';
@@ -209,11 +213,23 @@ final class _BiliAppShellState extends State<BiliAppShell>
 
   bool get _android => Theme.of(context).platform == TargetPlatform.android;
   bool get _mobile => WindowSizePolicy.isMobile(Theme.of(context).platform);
-  bool _compactLayout(double width) => WindowSizePolicy.compactLayout(
-    mobile: _mobile,
-    displaySize: WindowSizePolicy.displaySize(View.of(context)),
-    availableWidth: width,
-  );
+  bool _compactLayout(double width) {
+    // Keep the physical-display rule (it survives split windows and fold
+    // transitions) and add the viewport rule: a phone turned sideways is wide
+    // but short, so bottom navigation and compact channels still apply.
+    final compactByViewport = WindowSizePolicy.compactExtent(
+      extent: width,
+      viewport: MediaQuery.sizeOf(context),
+      mobile: _mobile,
+    );
+    return compactByViewport ||
+        WindowSizePolicy.compactLayout(
+          mobile: _mobile,
+          displaySize: WindowSizePolicy.displaySize(View.of(context)),
+          availableWidth: width,
+        );
+  }
+
   bool get _compactChannels => _compactLayout(
     MediaQuery.sizeOf(context).width - MediaQuery.paddingOf(context).horizontal,
   );
@@ -348,6 +364,7 @@ final class _BiliAppShellState extends State<BiliAppShell>
         return;
       }
       _prunePages();
+      _enforcePlaybackLimit();
       _rememberSection(_displayTab.location, compact: _compactChannels);
       _restoreSearch();
       _revealActiveTab();
@@ -397,6 +414,21 @@ final class _BiliAppShellState extends State<BiliAppShell>
       if (liveIds.contains(key.$1)) return false;
       progress.dispose();
       return true;
+    });
+  }
+
+  /// Keeps only the most recent playback pages alive.
+  ///
+  /// Opening a chain of videos used to leave every one of them retained, each
+  /// holding a native player and an open stream. Eviction happens after the
+  /// frame so the navigation that triggered it is never rebuilt underneath
+  /// itself; the closed page is never the one on screen.
+  void _enforcePlaybackLimit() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      if (!_workspace.enforcePlaybackLimit()) return;
+      _prunePages();
+      setState(() {});
     });
   }
 
@@ -495,6 +527,7 @@ final class _BiliAppShellState extends State<BiliAppShell>
 
   bool _goBack() {
     if (_goBackWithinPage()) return true;
+    final leavingPlayback = _workspace.active.isPlayback;
     if (!(_canReturnFromMessages
         ? _workspace.returnFromMessages()
         : _desktopDual
@@ -502,6 +535,9 @@ final class _BiliAppShellState extends State<BiliAppShell>
         : _workspace.goBack())) {
       return false;
     }
+    // Draw the cover springing back into its card while the workspace swaps
+    // pages underneath the root overlay.
+    if (leavingPlayback) VideoOpenOrigin.playReverse(context);
     _prunePages();
     setState(() {});
     _commitWorkspace();
@@ -845,15 +881,15 @@ final class _BiliAppShellState extends State<BiliAppShell>
                             padding: compact
                                 ? EdgeInsets.zero
                                 : EdgeInsets.fromLTRB(
-                                    _sidebarCollapsed ? 16 : 0,
+                                    _sidebarCollapsed ? AppleSpacing.l : 0,
                                     12,
-                                    16,
-                                    16,
+                                    AppleSpacing.l,
+                                    AppleSpacing.l,
                                   ),
                             child: ClipRRect(
-                              borderRadius: BorderRadius.circular(
-                                compact ? 0 : 18,
-                              ),
+                              borderRadius: compact
+                                  ? BorderRadius.zero
+                                  : AppleRadius.panelBorder,
                               child: ColoredBox(
                                 color: colors.surface,
                                 // Switching a retained root restores dense image
@@ -1158,58 +1194,61 @@ final class _BiliAppShellState extends State<BiliAppShell>
     return Offstage(
       key: ValueKey(('workspace-view', key)),
       offstage: !current && !incoming,
-      child: PredictiveBackPageTransition(
-        progress: incoming || outgoing
-            ? back!.progress
-            : kAlwaysDismissedAnimation,
-        edge: back?.edge ?? SwipeEdge.left,
-        incoming: incoming,
-        child: IgnorePointer(
-          ignoring: !current,
-          child: ExcludeSemantics(
-            excluding: !current,
-            child: FocusScope(
-              canRequestFocus: current,
-              skipTraversal: !current,
-              child: WorkspaceActivity(
-                active: current,
-                previewing: incoming && !current,
-                child: WorkspaceMediaPermission(
-                  allowed: selected,
-                  child: PageStorage(
-                    bucket: _viewStorage.putIfAbsent(
-                      key,
-                      PageStorageBucket.new,
-                    ),
-                    child: WorkspacePageHeader(
-                      builder: _searchHeader,
-                      child: WorkspacePageNavigation(
-                        navigate: (location) =>
-                            _updatePageLocation(view, location),
-                        child: TabPagingScope(
-                          progress: _pagingFor(view),
-                          child: PageBackScope(
-                            controller: _backFor(tab.id),
-                            child: Builder(
-                              builder: (context) {
-                                final page =
-                                    widget.pageBuilder?.call(context, view) ??
-                                    widget.child;
-                                return PlaybackNavigation(
-                                  onBack:
-                                      _desktopDual &&
-                                          tab.id == _workspace.playbackId
-                                      ? _playbackWindowBack
-                                      : () {
-                                          _goBack();
-                                        },
-                                  onHome: _playbackHome,
-                                  showInPlayer: _playerShowsNavigation,
-                                  child: _android
-                                      ? _workspaceFrame(context, view, page)
-                                      : page,
-                                );
-                              },
+      child: ApplePageEnter(
+        active: current,
+        child: PredictiveBackPageTransition(
+          progress: incoming || outgoing
+              ? back!.progress
+              : kAlwaysDismissedAnimation,
+          edge: back?.edge ?? SwipeEdge.left,
+          incoming: incoming,
+          child: IgnorePointer(
+            ignoring: !current,
+            child: ExcludeSemantics(
+              excluding: !current,
+              child: FocusScope(
+                canRequestFocus: current,
+                skipTraversal: !current,
+                child: WorkspaceActivity(
+                  active: current,
+                  previewing: incoming && !current,
+                  child: WorkspaceMediaPermission(
+                    allowed: selected,
+                    child: PageStorage(
+                      bucket: _viewStorage.putIfAbsent(
+                        key,
+                        PageStorageBucket.new,
+                      ),
+                      child: WorkspacePageHeader(
+                        builder: _searchHeader,
+                        child: WorkspacePageNavigation(
+                          navigate: (location) =>
+                              _updatePageLocation(view, location),
+                          child: TabPagingScope(
+                            progress: _pagingFor(view),
+                            child: PageBackScope(
+                              controller: _backFor(tab.id),
+                              child: Builder(
+                                builder: (context) {
+                                  final page =
+                                      widget.pageBuilder?.call(context, view) ??
+                                      widget.child;
+                                  return PlaybackNavigation(
+                                    onBack:
+                                        _desktopDual &&
+                                            tab.id == _workspace.playbackId
+                                        ? _playbackWindowBack
+                                        : () {
+                                            _goBack();
+                                          },
+                                    onHome: _playbackHome,
+                                    showInPlayer: _playerShowsNavigation,
+                                    child: _android
+                                        ? _workspaceFrame(context, view, page)
+                                        : page,
+                                  );
+                                },
+                              ),
                             ),
                           ),
                         ),
@@ -1290,10 +1329,9 @@ final class _BiliAppShellState extends State<BiliAppShell>
                 minimumSize: const Size(36, 28),
                 padding: const EdgeInsets.symmetric(horizontal: 8),
                 foregroundColor: colors.onSurfaceVariant,
-                backgroundColor: colors.surfaceContainerLow,
+                backgroundColor: colors.surfaceContainer,
                 shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(8),
-                  side: BorderSide(color: colors.outlineVariant),
+                  borderRadius: AppleRadius.controlBorder,
                 ),
               ),
         onPressed: () {
@@ -1337,10 +1375,9 @@ final class _BiliAppShellState extends State<BiliAppShell>
                 disabledForegroundColor: colors.onSurface.withValues(
                   alpha: .38,
                 ),
-                backgroundColor: colors.surfaceContainerLow,
+                backgroundColor: colors.surfaceContainer,
                 shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(8),
-                  side: BorderSide(color: colors.outlineVariant),
+                  borderRadius: AppleRadius.controlBorder,
                 ),
               ),
         onPressed: enabled ? _returnToPlayback : null,
@@ -1417,10 +1454,10 @@ final class _BiliAppShellState extends State<BiliAppShell>
         message: label,
         child: Material(
           color: selected ? colors.primaryContainer : Colors.transparent,
-          borderRadius: BorderRadius.circular(12),
+          borderRadius: AppleRadius.controlBorder,
           child: InkWell(
             key: key,
-            borderRadius: BorderRadius.circular(12),
+            borderRadius: AppleRadius.controlBorder,
             onTap: onTap,
             child: Semantics(
               label: iconOnly ? label : null,
@@ -1673,18 +1710,25 @@ final class _BiliAppShellState extends State<BiliAppShell>
       WorkspaceSection.settings => tab.isSettings,
       _ => tab.isBrowse,
     };
+    final compactNavigation = AppLayout.compactNavigationOf(context);
     return NavigationBar(
       key: const ValueKey('workspace-bottom-navigation'),
       animationDuration: MediaQuery.disableAnimationsOf(context)
           ? Duration.zero
           : const Duration(milliseconds: 220),
-      height: _bottomNavigationHeight,
+      // A landscape phone has ~360dp of height; a 52dp labelled bar costs
+      // too much of the content area. Icons alone keep all destinations
+      // tappable at 44dp without collapsing the page above them.
+      height: compactNavigation ? 44.0 : _bottomNavigationHeight,
+      labelBehavior: compactNavigation
+          ? NavigationDestinationLabelBehavior.alwaysHide
+          : null,
       labelPadding: EdgeInsets.zero,
       labelTextStyle: WidgetStateProperty.resolveWith((states) {
         final colors = Theme.of(context).colorScheme;
         return _bottomNavigationLabelStyle.copyWith(
           color: states.contains(WidgetState.selected)
-              ? colors.onSurface
+              ? colors.primary
               : colors.onSurfaceVariant,
         );
       }),
@@ -1722,7 +1766,9 @@ final class _BiliAppShellState extends State<BiliAppShell>
       child: SafeArea(
         top: false,
         child: SizedBox(
-          height: _bottomNavigationHeight,
+          height: AppLayout.compactNavigationOf(context)
+              ? 44.0
+              : _bottomNavigationHeight,
           child: Row(
             children: [
               for (final section in sections)
@@ -1784,7 +1830,7 @@ final class _BiliAppShellState extends State<BiliAppShell>
   Widget _tabStrip(BuildContext context, {Widget? navigationTools}) {
     final colors = Theme.of(context).colorScheme;
     return ColoredBox(
-      color: colors.surfaceContainerLow,
+      color: colors.surfaceContainer,
       child: SizedBox(
         key: const ValueKey('workspace-tabs-toolbar'),
         height: workspaceHeaderVisibleForPlatform(Theme.of(context).platform)
@@ -1904,11 +1950,15 @@ final class _BiliAppShellState extends State<BiliAppShell>
       padding: const EdgeInsets.only(left: 3, top: 4),
       child: Material(
         color: selected ? colors.surface : Colors.transparent,
-        borderRadius: const BorderRadius.vertical(top: Radius.circular(10)),
+        borderRadius: const BorderRadius.vertical(
+          top: Radius.circular(AppleRadius.control),
+        ),
         child: InkWell(
           key: ValueKey('workspace-tab-${tab.id}'),
           onTap: () => _selectTab(tab.id),
-          borderRadius: const BorderRadius.vertical(top: Radius.circular(10)),
+          borderRadius: const BorderRadius.vertical(
+            top: Radius.circular(AppleRadius.control),
+          ),
           child: Semantics(
             selected: selected,
             button: true,
@@ -2002,6 +2052,24 @@ final class _BiliAppShellState extends State<BiliAppShell>
       compact: _compactChannels,
     );
     final tabs = channelsForSection(section, compact: _compactChannels);
+    // The pager builds its pages from its own compact rule, which on a tablet
+    // held sideways disagrees with this strip: the strip is compact (a
+    // phone-class display) while the pager is not, so the pager's page order
+    // skips the channels this strip shows inline. A raw page index then lands
+    // on a neighbouring label. Hand the strip the order the pager actually
+    // uses so it can map positions instead of trusting the index.
+    final anchor = selected ?? (tabs.isEmpty ? null : tabs.first);
+    List<HomeChannel>? pagerOrder;
+    if (anchor != null) {
+      for (final group in channelGroupsForNavigation(
+        compact: AppLayout.compactOf(context),
+      )) {
+        if (group.contains(anchor)) {
+          pagerOrder = group;
+          break;
+        }
+      }
+    }
     final equalWidthTabs = compact && section == WorkspaceSection.dynamic;
     return SizedBox(
       height: PageTabStyle.barHeight,
@@ -2015,6 +2083,7 @@ final class _BiliAppShellState extends State<BiliAppShell>
             tabs: tabs,
             value: selected,
             progress: _pagingFor(active),
+            progressTabs: pagerOrder,
             onSelected: _selectChannel,
             itemKey: (channel) => ValueKey('channel-${channel.name}'),
             spacing: equalWidthTabs ? 0 : 3,

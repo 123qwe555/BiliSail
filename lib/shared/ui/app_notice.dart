@@ -2,6 +2,9 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 
+import 'apple_design.dart';
+import 'apple_motion.dart';
+
 /// Shows one transient notice above the app's routes without blocking input.
 void showAppNotice(BuildContext context, String message) {
   final host = context.findAncestorStateOfType<_AppNoticeHostState>();
@@ -63,26 +66,32 @@ class _AppNoticeHostState extends State<AppNoticeHost> {
                     alignment: const Alignment(0, .35),
                     child: Semantics(
                       liveRegion: true,
-                      child: Material(
-                        color: theme.colorScheme.inverseSurface.withValues(
-                          alpha: .95,
-                        ),
-                        elevation: 4,
-                        shadowColor: Colors.black26,
-                        borderRadius: BorderRadius.circular(8),
-                        child: Container(
-                          constraints: const BoxConstraints(maxWidth: 320),
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 16,
-                            vertical: 10,
-                          ),
-                          child: Text(
-                            message,
-                            textAlign: TextAlign.center,
-                            style: theme.textTheme.bodyMedium?.copyWith(
-                              color: theme.colorScheme.onInverseSurface,
-                              fontSize: 13,
-                              height: 1.4,
+                      child: AppleAppear(
+                        fromScale: 0.92,
+                        offsetY: 8,
+                        duration: AppleMotion.quick,
+                        child: Material(
+                          color: theme.brightness == Brightness.dark
+                              ? const Color(0xE62C2C2E)
+                              : const Color(0xE61C1C1E),
+                          elevation: 0,
+                          shadowColor: Colors.transparent,
+                          borderRadius: AppleRadius.controlBorder,
+                          child: Container(
+                            constraints: const BoxConstraints(maxWidth: 320),
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: AppleSpacing.xl,
+                              vertical: AppleSpacing.m,
+                            ),
+                            child: Text(
+                              message,
+                              textAlign: TextAlign.center,
+                              style: theme.textTheme.bodyMedium?.copyWith(
+                                color: Colors.white,
+                                fontSize: 14,
+                                height: 1.35,
+                                letterSpacing: -0.1,
+                              ),
                             ),
                           ),
                         ),

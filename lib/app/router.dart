@@ -60,6 +60,7 @@ import 'workspace_tabs.dart';
 import 'workspace_root_page.dart';
 import 'workspace_navigation.dart';
 import 'platform_defaults.dart';
+import '../shared/ui/app_layout.dart';
 
 GoRouter createBiliRouter({
   required VideoPlayerBuilder playerBuilder,
@@ -340,7 +341,7 @@ final class _WorkspacePage extends ConsumerWidget {
       location: location,
       builder: (context) {
         final channel = _channelFor(location);
-        final compact = MediaQuery.sizeOf(context).width < 600;
+        final compact = AppLayout.compactOf(context);
         return FeedScreen(
           key: PageStorageKey('feed-${tab.id}'),
           channel: channel,

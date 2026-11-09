@@ -406,12 +406,28 @@ class WindowService {
   bool get hasCustomTitleBar => Platform.isWindows && viewId == null;
   bool _fullScreen = false;
   bool? _browsePortrait;
+  bool _browseLandscapeAllowed = false;
   bool _mobileFullScreenRequested = false;
   FullScreenOrientation? _mobileFullScreenOrientation;
   FullScreenOrientation? _appliedMobileOrientation;
   Future<void> _orientationCommands = Future<void>.value();
   bool get isFullScreen => _fullScreen;
-  bool get keepsBrowsePortrait => _browsePortrait == true;
+
+  /// Whether a portrait lock is currently applied while browsing. Playback
+  /// uses this to distinguish a locked phone from one that is simply being
+  /// held upright with rotation enabled.
+  bool get keepsBrowsePortrait =>
+      _browsePortrait == true && !_browseLandscapeAllowed;
+
+  /// Lets phone browsing follow the system rotation preference instead of
+  /// being pinned to portraitUp. Fullscreen playback still requests an
+  /// explicit orientation, so relaxing the browse lock never changes video
+  /// behaviour. Desktop windows and large displays are unaffected.
+  Future<void> setBrowseLandscapeAllowed(bool value) {
+    if (_browseLandscapeAllowed == value) return Future<void>.value();
+    _browseLandscapeAllowed = value;
+    return _applyMobileOrientation();
+  }
 
   Future<void> updateDisplaySize(Size logicalDisplaySize) {
     if (hasDesktopWindow || viewId != null) return Future<void>.value();
@@ -433,8 +449,11 @@ class WindowService {
           ? null
           : _mobileFullScreenRequested
           ? _mobileFullScreenOrientation
-          : _browsePortrait == true
+          : _browsePortrait == true && !_browseLandscapeAllowed
           ? FullScreenOrientation.portrait
+          // A phone allowed to rotate reports no preference and therefore
+          // follows the system rotation lock. Fullscreen still sets an
+          // explicit orientation through the branch above.
           : null;
       if (orientation == _appliedMobileOrientation) return;
       await SystemChrome.setPreferredOrientations(switch (orientation) {

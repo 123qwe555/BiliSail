@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
 
+import 'app_layout.dart';
 import 'text_measurement_cache.dart';
 
 const _desktopSpacing = 20.0;
@@ -9,7 +10,9 @@ const _desktopSpacing = 20.0;
   BuildContext context,
   double extent,
 ) {
-  final compact = extent < 600;
+  // Phone landscape hands a LayoutBuilder ~800dp of width but only ~360dp of
+  // height; compact spacing and insets keep a full card row visible there.
+  final compact = AppLayout.compactOf(context, extent: extent);
   final spacing = compact ? 6.0 : _desktopSpacing;
   final textScaler = MediaQuery.textScalerOf(context);
   // Sample the 15px card title. Android's nonlinear font scaling leaves large
@@ -52,7 +55,11 @@ final class SliverCardGridPadding extends StatelessWidget {
   @override
   Widget build(BuildContext context) => SliverLayoutBuilder(
     builder: (context, constraints) {
-      final inset = constraints.crossAxisExtent < 600 ? 4.0 : desktopInset;
+      final compact = AppLayout.compactOf(
+        context,
+        extent: constraints.crossAxisExtent,
+      );
+      final inset = compact ? 4.0 : desktopInset;
       return SliverPadding(
         padding: EdgeInsets.fromLTRB(inset, top, inset, bottom),
         sliver: sliver,

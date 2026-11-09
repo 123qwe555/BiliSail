@@ -8,6 +8,7 @@ import 'app_dialog.dart';
 import 'app_notice.dart';
 import 'danmaku_send_style_panel.dart';
 import 'player_controls_menu_scope.dart';
+import 'app_layout.dart';
 
 final class DanmakuSendStyleButton extends StatefulWidget {
   const DanmakuSendStyleButton({
@@ -41,7 +42,7 @@ final class _DanmakuSendStyleButtonState extends State<DanmakuSendStyleButton> {
           await showAppDialog<({int mode, int color, bool colorful})>(
             context: context,
             builder: (context) {
-              final compact = MediaQuery.sizeOf(context).width < 600;
+              final compact = AppLayout.compactOf(context);
               return Dialog(
                 alignment: compact ? Alignment.bottomCenter : Alignment.center,
                 insetPadding: EdgeInsets.all(compact ? 12 : 24),

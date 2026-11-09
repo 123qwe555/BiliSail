@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'app_dialog.dart';
+import 'apple_motion.dart';
 import '../../domain/user.dart';
 import '../../features/video/application/video_author_controller.dart';
 import '../../features/video/domain/video_author_repository.dart';
@@ -189,7 +190,7 @@ final class UserFollowButton extends ConsumerWidget {
       mainAxisSize: MainAxisSize.min,
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        button,
+        ApplePressable(enabled: !state.busy && !state.loading, child: button),
         if (showMessage && state.message != null)
           ConstrainedBox(
             constraints: const BoxConstraints(maxWidth: 320),

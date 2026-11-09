@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 
+import '../../../shared/ui/app_layout.dart';
+
 class PlayerDanmakuDialog extends StatelessWidget {
   const PlayerDanmakuDialog({super.key, required this.composer});
 
@@ -7,7 +9,7 @@ class PlayerDanmakuDialog extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final narrow = MediaQuery.sizeOf(context).width < 600;
+    final narrow = AppLayout.compactOf(context);
     return Dialog(
       key: const ValueKey('player-danmaku-dialog'),
       alignment: narrow ? Alignment.bottomCenter : Alignment.center,

@@ -3,6 +3,8 @@ import 'dart:async';
 import '../../domain/user.dart';
 import '../../features/comments/domain/comment_time.dart';
 import 'bili_icons.dart';
+import 'apple_design.dart';
+import 'video_open_transition.dart';
 import 'app_cover_image.dart';
 import 'bili_badges.dart';
 import 'highlighted_text.dart';
@@ -20,6 +22,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter/foundation.dart' show listEquals;
 
 import '../../domain/video.dart';
+import 'app_layout.dart';
+import 'video_tap_gate.dart';
 
 String compactCount(int? count) {
   if (count == null) return '—';
@@ -179,6 +183,7 @@ final class _VideoCardState extends State<VideoCard> {
   VideoCardInteractions? _interactions;
   Widget? _card;
   final _menuAnchor = GlobalKey();
+  final _coverBox = GlobalKey();
   StreamSubscription<VideoId>? _watchLaterSubscription;
 
   VideoCardMenu? get _menu {
@@ -260,6 +265,16 @@ final class _VideoCardState extends State<VideoCard> {
     }
   }
 
+  void _recordOpenOrigin() {
+    final box = _coverBox.currentContext?.findRenderObject();
+    if (box is RenderBox && box.hasSize) {
+      VideoOpenOrigin.record(
+        box.localToGlobal(Offset.zero) & box.size,
+        widget.video.coverUrl,
+      );
+    }
+  }
+
   @override
   Widget build(BuildContext context) => _card ??= LayoutBuilder(
     builder: (context, constraints) =>
@@ -289,17 +304,25 @@ final class _VideoCardState extends State<VideoCard> {
       child: AnimatedContainer(
         duration: const Duration(milliseconds: 120),
         decoration: BoxDecoration(
-          borderRadius: BorderRadius.circular(8),
+          borderRadius: AppleRadius.controlBorder,
           border: Border.all(
             color: _focused ? scheme.primary : Colors.transparent,
           ),
         ),
         child: Material(
           color: Colors.transparent,
-          borderRadius: BorderRadius.circular(7),
+          borderRadius: AppleRadius.controlBorder,
           clipBehavior: Clip.none,
           child: InkWell(
-            onTap: widget.feedback == null ? () => widget.onTap() : null,
+            onTap: widget.feedback == null
+                ? () {
+                    // Ignore repeat taps: a second page would stack another
+                    // playback session on top of one that is still resolving.
+                    if (!VideoTapGate.shouldOpen()) return;
+                    _recordOpenOrigin();
+                    widget.onTap();
+                  }
+                : null,
             onLongPress: widget.feedback == null ? _showMenu : null,
             hoverColor: Colors.transparent,
             hoverDuration: Duration.zero,
@@ -308,6 +331,7 @@ final class _VideoCardState extends State<VideoCard> {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 AspectRatio(
+                  key: _coverBox,
                   aspectRatio: 16 / 9,
                   child: switch (widget.feedback) {
                     final feedback? => VideoCardFeedbackCover(
@@ -555,7 +579,7 @@ final class _VideoCardState extends State<VideoCard> {
       }
       final menu = _menu;
       if (menu == null || !_canShowMenu) return;
-      if (MediaQuery.sizeOf(context).width < 600) {
+      if (AppLayout.compactOf(context)) {
         selected = await showVideoCardMenuSheet(context, [
           for (final action in menu.actions)
             (value: action, icon: _menuIcon(action), label: _menuLabel(action)),
@@ -588,11 +612,7 @@ final class _VideoCardState extends State<VideoCard> {
           surfaceTintColor: Colors.transparent,
           elevation: 3,
           shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(8),
-            side: BorderSide(
-              color: Theme.of(context).colorScheme.outlineVariant
-                  .withValues(alpha: .6),
-            ),
+            borderRadius: AppleRadius.controlBorder,
           ),
           items: [
             for (final action in menu.actions)
@@ -943,10 +963,10 @@ final class _AuthorMetadata extends StatelessWidget {
       message: text,
       child: DecoratedBox(
         decoration: BoxDecoration(
-          color: const Color(
-            0xFFFF7F50,
-          ).withValues(alpha: theme.brightness == Brightness.dark ? .18 : .1),
-          borderRadius: BorderRadius.circular(3),
+          color: theme.colorScheme.primary.withValues(
+            alpha: theme.brightness == Brightness.dark ? .18 : .1,
+          ),
+          borderRadius: BorderRadius.circular(6),
         ),
         child: Padding(
           padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
@@ -954,7 +974,11 @@ final class _AuthorMetadata extends StatelessWidget {
             text,
             maxLines: 1,
             overflow: TextOverflow.ellipsis,
-            style: const TextStyle(fontSize: 11, color: Color(0xFFFF7F50)),
+            style: TextStyle(
+              fontSize: 11,
+              fontWeight: FontWeight.w500,
+              color: theme.colorScheme.primary,
+            ),
           ),
         ),
       ),

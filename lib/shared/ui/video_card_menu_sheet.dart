@@ -4,6 +4,8 @@ import '../../core/presentation/workspace_activity.dart';
 import '../../domain/video.dart';
 import '../../features/video/domain/video_card_interactions.dart';
 import 'video_card_interaction_scope.dart';
+import 'app_layout.dart';
+import 'apple_motion.dart';
 
 Future<T?> showVideoCardMenuSheet<T>(
   BuildContext context,
@@ -15,6 +17,7 @@ Future<T?> showVideoCardMenuSheet<T>(
     useSafeArea: true,
     isScrollControlled: true,
     showDragHandle: true,
+    sheetAnimationStyle: AppleMotion.sheet,
     backgroundColor: Theme.of(context).colorScheme.surface,
     shape: const RoundedRectangleBorder(
       borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
@@ -54,7 +57,7 @@ Future<void> showVideoCardWatchLaterMenu(
   bool Function()? isCurrent,
 }) async {
   if (!id.isValid ||
-      MediaQuery.sizeOf(context).width >= 600 ||
+      !AppLayout.compactOf(context) ||
       !WorkspaceActivity.isActive(context)) {
     return;
   }

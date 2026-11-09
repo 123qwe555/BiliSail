@@ -4,6 +4,7 @@ import 'package:bili_player/bili_player.dart';
 import 'package:flutter/material.dart';
 
 import '../../../core/platform/window_service.dart';
+import '../../../shared/ui/apple_design.dart';
 import '../application/playback_session.dart';
 import 'playback_snapshot_builder.dart';
 
@@ -79,7 +80,7 @@ class _MiniPlayerState extends State<MiniPlayer> {
     onPressed: action,
     isSelected: selected,
     style: IconButton.styleFrom(
-      foregroundColor: selected ? const Color(0xffff9ab8) : Colors.white,
+      foregroundColor: selected ? ApplePalette.darkTint : Colors.white,
       backgroundColor: Colors.black38,
       minimumSize: const Size(40, 40),
       padding: const EdgeInsets.all(8),

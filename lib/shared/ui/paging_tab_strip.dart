@@ -5,6 +5,29 @@ import 'package:flutter/scheduler.dart';
 import 'retained_tab_view.dart';
 import 'tab_paging_motion.dart';
 
+/// Maps a pager page position onto a strip's own index space.
+///
+/// The pager and the strip normally share one order, but they do not always:
+/// the strip may inline a channel the pager keeps in its own group, which
+/// shifts every later page by one. Mapping through the pager's real order keeps
+/// the indicator on the label that was actually selected.
+double mapPagingPosition<T extends Object>({
+  required List<T>? order,
+  required List<T> tabs,
+  required double value,
+  required int fallbackIndex,
+}) {
+  if (order == null || order.isEmpty || tabs.isEmpty) return value;
+  final start = value.floor().clamp(0, order.length - 1);
+  final end = value.ceil().clamp(0, order.length - 1);
+  final from = tabs.indexOf(order[start]);
+  final to = tabs.indexOf(order[end]);
+  // Crossing into a channel this strip does not show must not sweep through
+  // unrelated labels.
+  if (from < 0 || to < 0) return fallbackIndex.toDouble();
+  return from + (to - from) * (value - start);
+}
+
 /// The indicator and horizontal strip follow the content pages' progress.
 final class PagingTabStrip<T extends Object> extends StatefulWidget {
   const PagingTabStrip({
@@ -57,16 +80,12 @@ final class _PagingTabStripState<T extends Object>
 
   double get _position {
     if (widget.progress?.isAttached != true) return _fallback.value;
-    final value = widget.progress?.value ?? _fallback.value;
-    final order = widget.progressTabs;
-    if (order == null) return value;
-    final start = value.floor().clamp(0, order.length - 1);
-    final end = value.ceil().clamp(0, order.length - 1);
-    final from = widget.tabs.indexOf(order[start]);
-    final to = widget.tabs.indexOf(order[end]);
-    // Crossing a navigation group must not sweep through unrelated labels.
-    if (from < 0 || to < 0) return _indexOf(widget.value).toDouble();
-    return from + (to - from) * (value - start);
+    return mapPagingPosition(
+      order: widget.progressTabs,
+      tabs: widget.tabs,
+      value: widget.progress?.value ?? _fallback.value,
+      fallbackIndex: _indexOf(widget.value),
+    );
   }
 
   @override

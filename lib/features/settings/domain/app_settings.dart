@@ -74,6 +74,7 @@ final class AppSettings {
     this.sidebarCollapsed = false,
     this.defaultDynamicTab = DynamicPageTab.dynamic,
     this.allowConcurrentPlayback = false,
+    this.allowPhoneLandscape = true,
     this.font = AppFontPreference.harmonyOsSans,
     this.systemFontFamily = '',
     this.cacheImages = true,
@@ -96,6 +97,7 @@ final class AppSettings {
     this.highEnergyProgressEnabled = false,
     this.playerControlsMode = PlayerControlsMode.click,
     this.fullscreenSwipeControls = true,
+    this.autoFullscreenOnOpen = false,
     this.playerFullscreenGestureReverse = false,
     this.playerFullscreenGesture = true,
     this.playerShrinkVideo = true,
@@ -159,12 +161,14 @@ final class AppSettings {
     this.sidebarCollapsed = false,
     this.defaultDynamicTab = DynamicPageTab.dynamic,
     this.allowConcurrentPlayback = false,
+    this.allowPhoneLandscape = true,
     this.videoCardHoverPlayback = true,
     this.highEnergyProgressEnabled = false,
     this.danmakuArea = 0.75,
     this.danmakuFontScale = 1.0,
     this.playerControlsMode = PlayerControlsMode.click,
     this.fullscreenSwipeControls = true,
+    this.autoFullscreenOnOpen = false,
     this.playerFullscreenGestureReverse = false,
     this.playerFullscreenGesture = true,
     this.playerShrinkVideo = true,
@@ -236,6 +240,11 @@ final class AppSettings {
   final bool sidebarCollapsed;
   final DynamicPageTab defaultDynamicTab;
   final bool allowConcurrentPlayback;
+
+  /// Allow phones to follow the system rotation preference while browsing.
+  /// When false, browsing is pinned to portrait and only fullscreen playback
+  /// may request landscape.
+  final bool allowPhoneLandscape;
   bool get concurrentPlaybackEnabled =>
       navigationMode == WorkspaceNavigationMode.multipleTabs &&
       allowConcurrentPlayback;
@@ -264,6 +273,9 @@ final class AppSettings {
   final bool highEnergyProgressEnabled;
   final PlayerControlsMode playerControlsMode;
   final bool fullscreenSwipeControls;
+
+  /// Enter fullscreen as soon as a video page becomes active.
+  final bool autoFullscreenOnOpen;
   final bool playerFullscreenGestureReverse;
   final bool playerFullscreenGesture;
   final bool playerShrinkVideo;
@@ -332,6 +344,7 @@ final class AppSettings {
     bool? sidebarCollapsed,
     DynamicPageTab? defaultDynamicTab,
     bool? allowConcurrentPlayback,
+    bool? allowPhoneLandscape,
     AppFontPreference? font,
     String? systemFontFamily,
     bool? cacheImages,
@@ -354,6 +367,7 @@ final class AppSettings {
     bool? highEnergyProgressEnabled,
     PlayerControlsMode? playerControlsMode,
     bool? fullscreenSwipeControls,
+    bool? autoFullscreenOnOpen,
     bool? playerFullscreenGestureReverse,
     bool? playerFullscreenGesture,
     bool? playerShrinkVideo,
@@ -408,6 +422,7 @@ final class AppSettings {
     defaultDynamicTab: defaultDynamicTab ?? this.defaultDynamicTab,
     allowConcurrentPlayback:
         allowConcurrentPlayback ?? this.allowConcurrentPlayback,
+    allowPhoneLandscape: allowPhoneLandscape ?? this.allowPhoneLandscape,
     font: font ?? this.font,
     systemFontFamily: systemFontFamily ?? this.systemFontFamily,
     cacheImages: cacheImages ?? this.cacheImages,
@@ -453,6 +468,7 @@ final class AppSettings {
     playerShrinkVideo: playerShrinkVideo ?? this.playerShrinkVideo,
     fullscreenSwipeControls:
         fullscreenSwipeControls ?? this.fullscreenSwipeControls,
+    autoFullscreenOnOpen: autoFullscreenOnOpen ?? this.autoFullscreenOnOpen,
     preferredQuality: preferredQuality ?? this.preferredQuality,
     preferredLiveQuality: preferredLiveQuality ?? this.preferredLiveQuality,
     liveStreamPreference: liveStreamPreference ?? this.liveStreamPreference,

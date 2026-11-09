@@ -13,6 +13,7 @@ import '../../../shared/ui/retained_tab_view.dart';
 import '../../../shared/ui/smooth_scroll_behavior.dart';
 import '../../../shared/ui/state_view.dart';
 import '../../../shared/ui/app_dialog.dart';
+import '../../../shared/ui/apple_motion.dart';
 import '../../auth/application/auth_controller.dart';
 import '../application/messages_controller.dart';
 import '../application/message_center_controller.dart';
@@ -23,6 +24,7 @@ import 'message_center_views.dart';
 import 'message_composer_bar.dart';
 import 'message_rich_text.dart';
 import 'message_reply_sheet.dart';
+import '../../../shared/ui/app_layout.dart';
 
 class MessagesScreen extends ConsumerStatefulWidget {
   const MessagesScreen({
@@ -186,7 +188,10 @@ class _MessagesScreenState extends ConsumerState<MessagesScreen> {
           children: [
             LayoutBuilder(
               builder: (context, constraints) {
-                if (constraints.maxWidth < 600 &&
+                if (AppLayout.compactOf(
+                      context,
+                      extent: constraints.maxWidth,
+                    ) &&
                     (section != InboxSection.private || selectedId != null)) {
                   return const SizedBox.shrink();
                 }
@@ -204,7 +209,10 @@ class _MessagesScreenState extends ConsumerState<MessagesScreen> {
               child: LayoutBuilder(
                 builder: (context, constraints) {
                   final sidebar = constraints.maxWidth >= 1000;
-                  final narrow = constraints.maxWidth < 600;
+                  final narrow = AppLayout.compactOf(
+                    context,
+                    extent: constraints.maxWidth,
+                  );
                   final pages = RetainedTabView<InboxSection>(
                     key: ValueKey(auth.$2),
                     viewKey: const ValueKey('message-section-pager'),
@@ -877,6 +885,7 @@ class _ConversationRow extends ConsumerWidget {
               final action = await showModalBottomSheet<_ConversationAction>(
                 context: context,
                 showDragHandle: true,
+                sheetAnimationStyle: AppleMotion.sheet,
                 builder: (context) => SafeArea(
                   child: Column(
                     mainAxisSize: MainAxisSize.min,

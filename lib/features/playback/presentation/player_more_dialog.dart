@@ -9,6 +9,7 @@ import 'live_stream_picker.dart';
 import 'playback_snapshot_builder.dart';
 import 'player_control_labels.dart';
 import 'listening_sleep_timer_button.dart';
+import '../../../shared/ui/app_layout.dart';
 
 class PlayerMoreDialog extends StatelessWidget {
   const PlayerMoreDialog({
@@ -29,7 +30,7 @@ class PlayerMoreDialog extends StatelessWidget {
   );
 
   Widget _buildDialog(BuildContext context) {
-    final narrow = MediaQuery.sizeOf(context).width < 600;
+    final narrow = AppLayout.compactOf(context);
     final dialog = Dialog(
       key: const ValueKey('player-more-dialog'),
       alignment: narrow ? Alignment.bottomCenter : Alignment.centerRight,

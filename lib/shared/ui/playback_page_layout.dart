@@ -22,6 +22,7 @@ class PlaybackPageLayout extends StatefulWidget {
     required this.toggleInfo,
     required this.toggleTooltip,
     this.minimumInfoHeight = 0,
+    this.leftContent,
   });
 
   final bool wide;
@@ -35,6 +36,12 @@ class PlaybackPageLayout extends StatefulWidget {
   final VoidCallback toggleInfo;
   final String toggleTooltip;
   final double minimumInfoHeight;
+
+  /// When provided in [wide] mode, the player sits at the top of the left
+  /// column (16:9, capped) and this content scrolls beneath it, while [info]
+  /// runs the full height on the right. Mirrors the tablet landscape browsing
+  /// layout (player + video details on the left, comments on the right).
+  final Widget? leftContent;
 
   @override
   State<PlaybackPageLayout> createState() => _PlaybackPageLayoutState();
@@ -62,7 +69,13 @@ class _PlaybackPageLayoutState extends State<PlaybackPageLayout> {
   @override
   Widget build(BuildContext context) => LayoutBuilder(
     builder: (context, bounds) {
-      final collapsed = widget.collapsedHeight;
+      // Keep a short window from making the player taller than the page. The
+      // 9/16 rule is computed from width, so a phone in landscape would
+      // otherwise ask for ~450dp inside a ~360dp viewport.
+      final collapsed = math.min(
+        widget.collapsedHeight,
+        math.max(160.0, bounds.maxHeight - 120),
+      );
       final dimensions = widget.dimensions;
       var expanded = collapsed;
       if (!widget.wide &&
@@ -81,7 +94,12 @@ class _PlaybackPageLayoutState extends State<PlaybackPageLayout> {
           ),
         );
       }
-      final infoWidth = widget.wide ? 380.0 : bounds.maxWidth;
+      // A phone held sideways is typically only ~800dp wide. The desktop
+      // 380dp column would leave less than a 16:9 player, so scale the column
+      // down to 38% with a floor; widths >= 1000 still get the full 380dp.
+      final infoWidth = widget.wide
+          ? math.min(380.0, math.max(240.0, bounds.maxWidth * 0.38))
+          : bounds.maxWidth;
       final playerWidth = widget.wide && widget.showInfo
           ? math.max(0.0, bounds.maxWidth - infoWidth)
           : bounds.maxWidth;
@@ -89,6 +107,63 @@ class _PlaybackPageLayoutState extends State<PlaybackPageLayout> {
       final pageHeight = widget.wide || !widget.showInfo || scrollRange > 0
           ? bounds.maxHeight
           : math.max(bounds.maxHeight, collapsed + widget.minimumInfoHeight);
+      // Tablet landscape: player on top of the video details on the left,
+      // full-height comment column on the right.
+      if (widget.wide && widget.leftContent != null) {
+        final playerHeight = math.min(
+          playerWidth * 9.0 / 16.0,
+          math.max(160.0, bounds.maxHeight - 160.0),
+        );
+        final cappedPlayerHeight = math.min(
+          playerHeight,
+          bounds.maxHeight * 0.6,
+        );
+        final rightWidth = widget.showInfo ? infoWidth : 0.0;
+        return Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            SizedBox(
+              width: playerWidth,
+              height: bounds.maxHeight,
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  SizedBox(height: cappedPlayerHeight, child: widget.player),
+                  Expanded(
+                    child: SingleChildScrollView(
+                      padding: EdgeInsets.zero,
+                      child: widget.leftContent!,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            SizedBox(
+              width: rightWidth,
+              height: bounds.maxHeight,
+              child: Stack(
+                children: [
+                  Offstage(offstage: !widget.showInfo, child: widget.info),
+                  if (widget.showInfo)
+                    Positioned(
+                      left: 0,
+                      top: math.max(
+                        0,
+                        cappedPlayerHeight / 2 -
+                            PlaybackSidebarToggle.size.height / 2,
+                      ),
+                      child: PlaybackSidebarToggle(
+                        tooltip: widget.toggleTooltip,
+                        onPressed: widget.toggleInfo,
+                        icon: Icons.chevron_right,
+                      ),
+                    ),
+                ],
+              ),
+            ),
+          ],
+        );
+      }
       return AnimatedBuilder(
         animation: _scroll,
         builder: (context, _) {

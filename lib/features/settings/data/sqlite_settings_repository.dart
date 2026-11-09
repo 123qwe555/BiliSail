@@ -96,6 +96,7 @@ class SqliteSettingsRepository implements SettingsRepository {
               .firstOrNull ??
           DynamicPageTab.dynamic,
       allowConcurrentPlayback: boolean('allowConcurrentPlayback', false),
+      allowPhoneLandscape: boolean('allowPhoneLandscape', true),
       cacheImages: boolean('cacheImages', true),
       recordSearchHistory: boolean('recordSearchHistory', true),
       checkPrereleaseUpdates: boolean('checkPrereleaseUpdates', false),
@@ -208,6 +209,7 @@ class SqliteSettingsRepository implements SettingsRepository {
       playbackRates: PlaybackRates.fromJson(decoded['playbackRates']),
       rememberPlaybackRate: boolean('rememberPlaybackRate', true),
       fullscreenSwipeControls: boolean('fullscreenSwipeControls', true),
+      autoFullscreenOnOpen: boolean('autoFullscreenOnOpen', false),
       playerFullscreenGestureReverse: boolean(
         'playerFullscreenGestureReverse',
         false,
@@ -278,7 +280,7 @@ class SqliteSettingsRepository implements SettingsRepository {
     return database.writeSetting(
       'preferences.v1',
       jsonEncode({
-        'schemaVersion': 42,
+        'schemaVersion': 43,
         'appIcon': value.appIcon.name,
         'recommendations': value.recommendations.toJson(),
         'navigationBarMode': value.navigationBarMode.name,
@@ -286,11 +288,13 @@ class SqliteSettingsRepository implements SettingsRepository {
         'sidebarCollapsed': value.sidebarCollapsed,
         'defaultDynamicTab': value.defaultDynamicTab.name,
         'fullscreenSwipeControls': value.fullscreenSwipeControls,
+        'autoFullscreenOnOpen': value.autoFullscreenOnOpen,
         'playerFullscreenGestureReverse': value.playerFullscreenGestureReverse,
         'playerFullscreenGesture': value.playerFullscreenGesture,
         'playerShrinkVideo': value.playerShrinkVideo,
         'navigationMode': value.navigationMode.name,
         'allowConcurrentPlayback': value.allowConcurrentPlayback,
+        'allowPhoneLandscape': value.allowPhoneLandscape,
         'cacheImages': value.cacheImages,
         'recordSearchHistory': value.recordSearchHistory,
         'checkPrereleaseUpdates': value.checkPrereleaseUpdates,

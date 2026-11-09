@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:math' as math;
 
 import 'package:bili_player/bili_player.dart';
 
@@ -11,6 +12,7 @@ import '../../../domain/app_failure.dart';
 import '../../../shared/ui/app_notice.dart';
 import '../../../core/network/api_requests.dart';
 
+import '../../../shared/ui/app_layout.dart';
 import '../../../shared/ui/playback_page_commands.dart';
 import '../../../shared/ui/playback_layout_builder.dart';
 import '../../../shared/ui/width_layout_builder.dart';
@@ -20,6 +22,7 @@ import '../../../shared/ui/state_view.dart';
 import '../../../shared/ui/app_cover_image.dart';
 import '../../../shared/ui/highlighted_text.dart';
 import '../../../shared/ui/playback_page_layout.dart';
+import '../../../shared/ui/video_open_transition.dart';
 import '../../../shared/ui/scroll_collapsing_header.dart';
 import '../../../shared/ui/playback_info_tabs.dart';
 import '../../../shared/ui/comment_detail_builder.dart';
@@ -188,12 +191,6 @@ final class _VideoScreenState extends ConsumerState<VideoScreen> {
 
   @override
   Widget build(BuildContext context) {
-    // Null waits for async settings; an explicit selection always takes priority.
-    final defaultShowComments = widget.defaultShowComments;
-    if (_tab == null && defaultShowComments != null) {
-      _tab = defaultShowComments ? 1 : 0;
-    }
-    final tab = _tab ?? 0;
     final profileQueue = switch (widget.queue) {
       final original? when original.isPaged => ref.watch(
         playbackQueueProvider(original.id),
@@ -264,9 +261,21 @@ final class _VideoScreenState extends ConsumerState<VideoScreen> {
       children: [
         WidthLayoutBuilder(
           builder: (context, width) {
-            final wide = width >= 1000;
+            // A phone turned sideways has plenty of width but little height.
+            // The stacked portrait layout would give the player 9/16 of the
+            // width (taller than the viewport), so use side-by-side instead.
+            final wide = AppLayout.playbackSideBySideOf(context, extent: width);
+            // In wide (landscape) mode the comment column uses tab 0 for
+            // comments and tab 1 for related videos; otherwise tab 0 is the
+            // intro and tab 1 is comments.
+            final defaultShowComments = widget.defaultShowComments;
+            if (_tab == null && defaultShowComments != null) {
+              _tab = defaultShowComments ? (wide ? 0 : 1) : 0;
+            }
+            final tab = _tab ?? 0;
             final showInfo = _infoVisible;
             void toggleInfo() => setState(() => _infoVisible = !_infoVisible);
+            final useThreeColumn = wide && queue == null;
             return PlaybackPageCommands(
               previousPart: () => _changePart(video, selected, -1),
               nextPart: () => _changePart(video, selected, 1),
@@ -553,12 +562,75 @@ final class _VideoScreenState extends ConsumerState<VideoScreen> {
                               collapsedChild: infoTabs,
                             ),
                     );
+                    // Landscape layout: a full-height right column with the
+                    // comment list and a related-videos tab, while the video
+                    // details stay beneath the player on the left.
+                    final wideInfo = Material(
+                      key: _infoKey,
+                      color: Theme.of(context).colorScheme.surface,
+                      borderRadius: BorderRadius.circular(6),
+                      clipBehavior: Clip.antiAlias,
+                      child: CommentDetailBuilder(
+                        target: switch (video.aid) {
+                          final String aid => CommentTarget(
+                            aid,
+                            CommentTargetType.video,
+                          ),
+                          null => null,
+                        },
+                        enabled: tab == 0,
+                        builder: (context, detailOpen) => PlaybackInfoTabs(
+                          key: ValueKey(video.summary.id),
+                          showNavigation: !detailOpen,
+                          value: tab,
+                          onChanged: (tab) => setState(() => _tab = tab),
+                          viewKey: const ValueKey('video-info-wide-swipe'),
+                          labels: const [Text('评论'), Text('相关视频推荐')],
+                          itemKey: (tab) =>
+                              ValueKey('wide-tab-${tab == 0 ? '评论' : '相关视频'}'),
+                          trailing: widget.menuBuilder?.call(
+                            context,
+                            video,
+                            selected,
+                          ),
+                          pageBuilder: (context, tab, active) => TickerMode(
+                            enabled: active,
+                            child: tab == 0
+                                ? VideoCommentsPanel(
+                                    detail: video,
+                                    onLogin: widget.onLogin,
+                                    onOpenUser: widget.onOpenUser,
+                                  )
+                                : CustomScrollView(
+                                    key: const ValueKey('video-related-scroll'),
+                                    slivers: [
+                                      SliverPadding(
+                                        padding: const EdgeInsets.fromLTRB(
+                                          12,
+                                          12,
+                                          12,
+                                          12,
+                                        ),
+                                        sliver: _RelatedVideosSliver(
+                                          id: widget.id,
+                                          onOpenVideo: widget.onOpenVideo,
+                                          onOpenUser: widget.onOpenUser,
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                          ),
+                        ),
+                      ),
+                    );
                     return PlaybackLayoutBuilder(
                       builder: (context, constraints, listening) =>
                           PlaybackVideoDimensions(
                             builder: (context, dimensions) =>
                                 PlaybackPageLayout(
-                                  minimumInfoHeight: 480,
+                                  minimumInfoHeight: AppLayout.shortOf(context)
+                                      ? 0
+                                      : 480,
                                   wide: wide,
                                   showInfo: showInfo,
                                   listening: listening,
@@ -569,13 +641,19 @@ final class _VideoScreenState extends ConsumerState<VideoScreen> {
                                       ? PlaybackLayoutBuilder.listeningHeight(
                                           constraints.maxHeight,
                                         )
-                                      : constraints.maxWidth * 9 / 16,
+                                      : math.min(
+                                          constraints.maxWidth * 9 / 16,
+                                          constraints.maxHeight.isFinite
+                                              ? constraints.maxHeight * 0.55
+                                              : constraints.maxWidth * 9 / 16,
+                                        ),
                                   contentKey: video.summary.id,
                                   player: KeyedSubtree(
                                     key: _playerKey,
-                                    child: playerContent,
+                                    child: VideoOpenPop(child: playerContent),
                                   ),
-                                  info: info,
+                                  leftContent: useThreeColumn ? content : null,
+                                  info: useThreeColumn ? wideInfo : info,
                                   toggleInfo: toggleInfo,
                                   toggleTooltip: showInfo ? '收起视频信息' : '展开视频信息',
                                 ),
@@ -1242,7 +1320,7 @@ final class _RelatedVideoCardState extends State<_RelatedVideoCard> {
                       query: '',
                       maxLines: 2,
                       showOverflowTooltip: true,
-                      tooltipTriggerMode: MediaQuery.sizeOf(context).width < 600
+                      tooltipTriggerMode: AppLayout.compactOf(context)
                           ? TooltipTriggerMode.manual
                           : TooltipTriggerMode.longPress,
                       style: Theme.of(context).textTheme.titleSmall,

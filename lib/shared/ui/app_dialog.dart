@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 
+import 'apple_motion.dart';
+
 /// Shows a Material dialog inside the caller's window, including desktop views.
 Future<T?> showAppDialog<T>({
   required BuildContext context,
@@ -51,7 +53,10 @@ Future<T?> showAppDialog<T>({
           traversalEdgeBehavior ?? TraversalEdgeBehavior.closedLoop,
       fullscreenDialog: fullscreenDialog,
       requestFocus: requestFocus,
-      animationStyle: animationStyle,
+      // The framework already scales and fades dialogs; swapping in the shared
+      // spring makes every one of them open/close with the same Apple feel
+      // without adding any extra widget layers.
+      animationStyle: animationStyle ?? AppleMotion.dialog,
     ),
   );
 }

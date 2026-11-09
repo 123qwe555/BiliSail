@@ -6,6 +6,7 @@ import 'package:bili_player/bili_player.dart';
 
 import '../../core/presentation/workspace_activity.dart';
 import '../../domain/app_failure.dart';
+import 'apple_design.dart';
 import '../../domain/request_cancellation.dart';
 import '../../domain/video.dart';
 import '../../features/video/domain/video_card_interactions.dart';
@@ -25,7 +26,7 @@ class VideoCardCover extends StatefulWidget {
     required this.video,
     required this.child,
     this.focused = false,
-    this.borderRadius = 6,
+    this.borderRadius = AppleRadius.control,
     this.hovered,
     this.showWatchLaterButton = true,
   });

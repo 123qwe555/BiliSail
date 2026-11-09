@@ -25,6 +25,7 @@ import 'app_icon_settings.dart';
 import 'recommendation_settings_section.dart';
 import 'cdn_settings_tile.dart';
 import 'log_export_button.dart';
+import '../../../shared/ui/app_layout.dart';
 
 const _usageNotice = <Widget>[
   Text('本应用是哔哩哔哩第三方客户端，视频、影视、直播及相关内容均来自哔哩哔哩，与官方无隶属关系。'),
@@ -115,7 +116,10 @@ final class _SettingsScreenState extends ConsumerState<SettingsScreen> {
         LayoutBuilder(
           builder: (context, constraints) {
             final textScale = MediaQuery.textScalerOf(context).scale(14) / 14;
-            final compact = constraints.maxWidth < 600 * textScale;
+            final compact = AppLayout.compactOf(
+              context,
+              extent: constraints.maxWidth / textScale,
+            );
             final resetEnabled =
                 !_resetting && ref.watch(settingsControllerProvider).hasValue;
             return Padding(
@@ -344,6 +348,12 @@ final class _SettingsCategoryPageState
                             '自动模式根据窗口宽度切换底栏和侧边栏；也可固定使用底栏或侧边栏。',
                             style: TextStyle(fontSize: 12),
                           ),
+                          _toggle(
+                            '允许手机横屏浏览',
+                            s.allowPhoneLandscape,
+                            controller.setAllowPhoneLandscape,
+                            '开启后手机浏览界面跟随系统旋转设置，横屏时使用紧凑导航和左右分栏播放布局；关闭后浏览界面固定竖屏，只有全屏播放会进入横屏。平板与桌面不受影响。',
+                          ),
                           _choices('侧栏样式', s.sidebarStyle, const {
                             SidebarStyle.automatic: '随窗口宽度',
                             SidebarStyle.expanded: '完整侧栏',
@@ -549,6 +559,12 @@ final class _SettingsCategoryPageState
                             s.resumePlayback,
                             controller.setResumePlayback,
                             '优先从本地记录继续观看，没有本地记录时使用云端进度',
+                          ),
+                          _toggle(
+                            '打开视频后自动全屏',
+                            s.autoFullscreenOnOpen,
+                            controller.setAutoFullscreenOnOpen,
+                            '进入播放页后立即切换为全屏播放；手动退出全屏后不会在同一次观看中重复进入',
                           ),
                           _choices(
                             '视频默认清晰度',

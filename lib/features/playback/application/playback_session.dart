@@ -666,6 +666,11 @@ class PlaybackSession extends ChangeNotifier {
     ContentPlaybackTarget? target,
     String? title,
     bool visible = true,
+
+    /// Overrides the autoplay decision for this open. Used to load a source
+    /// without starting it, so a transition can finish first; null keeps the
+    /// usual restore-or-autoplay rules.
+    bool? desiredPlaying,
   }) async {
     if (_disposed || !_owners.contains(owner)) return;
     if (identical(_activeOwner, owner) &&
@@ -740,6 +745,7 @@ class PlaybackSession extends ChangeNotifier {
       liveStream: restored?.liveStream,
       position: nextPlaying != null ? nextIntent?.position : restored?.position,
       desiredPlaying:
+          desiredPlaying ??
           nextPlaying ??
           restored?.desiredPlaying ??
           (sameOwner ? _desiredPlaying : _settings.autoPlay),

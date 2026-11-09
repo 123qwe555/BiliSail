@@ -438,6 +438,7 @@ class _BiliAppState extends ConsumerState<BiliApp> {
         scrollBehavior: const SmoothScrollBehavior(),
         builder: (context, child) => WindowOrientationHost(
           window: widget.dependencies.window,
+          allowPhoneLandscape: settings.allowPhoneLandscape,
           child: VideoCompositionScope(
             adapter: widget.videoComposition,
             child: SmoothScrollScope(

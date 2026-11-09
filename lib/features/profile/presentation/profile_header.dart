@@ -8,6 +8,7 @@ import '../../../shared/ui/app_cover_image.dart';
 import '../../../shared/ui/network_avatar.dart';
 import '../../../shared/ui/video_card.dart';
 import '../domain/profile_repository.dart';
+import '../../../shared/ui/app_layout.dart';
 
 class ProfileHeader extends StatefulWidget {
   const ProfileHeader({
@@ -760,7 +761,7 @@ class _ProfileVideoToolbarState extends State<ProfileVideoToolbar> {
     );
     return LayoutBuilder(
       builder: (context, constraints) {
-        if (constraints.maxWidth < 600) {
+        if (AppLayout.compactOf(context, extent: constraints.maxWidth)) {
           return Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [

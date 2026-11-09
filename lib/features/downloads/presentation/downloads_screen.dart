@@ -15,6 +15,7 @@ import '../../../shared/ui/state_view.dart';
 import '../application/download_controller.dart';
 import '../domain/download_models.dart';
 import 'download_destination_dialog.dart';
+import '../../../shared/ui/app_layout.dart';
 
 String downloadByteText(int bytes) {
   if (bytes < 1024) return '$bytes B';
@@ -166,7 +167,10 @@ final class _DownloadsScreenState extends ConsumerState<DownloadsScreen> {
       children: [
         LayoutBuilder(
           builder: (context, constraints) {
-            final compact = constraints.maxWidth < 600;
+            final compact = AppLayout.compactOf(
+              context,
+              extent: constraints.maxWidth,
+            );
             final actions = [
               IconButton(
                 tooltip: '刷新下载',

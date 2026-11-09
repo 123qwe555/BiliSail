@@ -1,13 +1,19 @@
 import 'package:flutter/material.dart';
 
 const desktopCaptionHeight = 44.0;
-const desktopCaptionTextStyle = TextStyle(fontSize: 13);
+const desktopCaptionTextStyle = TextStyle(
+  fontSize: 13,
+  fontWeight: FontWeight.w600,
+  letterSpacing: -0.2,
+);
 const desktopCaptionButtonStyle = ButtonStyle(
   fixedSize: WidgetStatePropertyAll(Size(46, desktopCaptionHeight)),
   padding: WidgetStatePropertyAll(EdgeInsets.zero),
   tapTargetSize: MaterialTapTargetSize.shrinkWrap,
   visualDensity: VisualDensity.standard,
-  shape: WidgetStatePropertyAll(RoundedRectangleBorder()),
+  shape: WidgetStatePropertyAll(
+    RoundedRectangleBorder(borderRadius: BorderRadius.all(Radius.circular(8))),
+  ),
 );
 
 class DesktopCaptionButton extends StatelessWidget {
@@ -33,7 +39,7 @@ class DesktopCaptionButton extends StatelessWidget {
         ? desktopCaptionButtonStyle.copyWith(
             backgroundColor: WidgetStateProperty.resolveWith(
               (states) => states.contains(WidgetState.hovered)
-                  ? const Color(0xffc42b1c)
+                  ? const Color(0xFFFF5F57)
                   : null,
             ),
             foregroundColor: WidgetStateProperty.resolveWith(

@@ -97,6 +97,8 @@ final class SettingsController extends AsyncNotifier<AppSettings> {
       update((current) => current.copyWith(defaultDynamicTab: value));
   Future<void> setAllowConcurrentPlayback(bool value) =>
       update((current) => current.copyWith(allowConcurrentPlayback: value));
+  Future<void> setAllowPhoneLandscape(bool value) =>
+      update((current) => current.copyWith(allowPhoneLandscape: value));
   Future<void> setFont(AppFontPreference value) =>
       update((current) => current.copyWith(font: value));
   Future<void> setSystemFont(String family) => update(
@@ -123,6 +125,8 @@ final class SettingsController extends AsyncNotifier<AppSettings> {
       update((current) => current.copyWith(playerControlsMode: value));
   Future<void> setFullscreenSwipeControls(bool value) =>
       update((current) => current.copyWith(fullscreenSwipeControls: value));
+  Future<void> setAutoFullscreenOnOpen(bool value) =>
+      update((current) => current.copyWith(autoFullscreenOnOpen: value));
   Future<void> setDanmakuShowVip(bool value) =>
       update((current) => current.copyWith(danmakuShowVip: value));
   Future<void> setDanmakuOpacity(double value) =>

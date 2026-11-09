@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/foundation.dart';
 
 import '../../../core/presentation/trackpad_back_region.dart';
+import '../../../shared/ui/apple_design.dart';
 import '../../../shared/ui/storyboard_thumbnail.dart';
 
 import '../domain/playback_timeline.dart';
@@ -689,7 +690,7 @@ class ChapterSliderTrackShape extends SliderTrackShape {
           rtl ? rect.right : playedX,
           segment.bottom,
         ),
-        paint..color = sliderTheme.activeTrackColor ?? const Color(0xffdf6589),
+        paint..color = sliderTheme.activeTrackColor ?? ApplePalette.darkTint,
       );
       canvas.restore();
     }

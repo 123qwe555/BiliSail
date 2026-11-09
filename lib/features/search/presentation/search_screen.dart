@@ -10,6 +10,7 @@ import '../../../shared/ui/state_view.dart';
 import '../application/search_controller.dart';
 import '../domain/search_result.dart';
 import 'search_results.dart';
+import '../../../shared/ui/app_layout.dart';
 
 final class SearchScreen extends ConsumerStatefulWidget {
   const SearchScreen({super.key, required this.query});
@@ -94,7 +95,10 @@ final class _SearchScreenState extends ConsumerState<SearchScreen> {
     final theme = Theme.of(context);
     return LayoutBuilder(
       builder: (context, constraints) {
-        final padding = constraints.maxWidth < 600 ? 12.0 : 28.0;
+        final padding =
+            AppLayout.compactOf(context, extent: constraints.maxWidth)
+            ? 12.0
+            : 28.0;
         return Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [

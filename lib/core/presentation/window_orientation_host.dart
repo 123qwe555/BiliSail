@@ -11,9 +11,16 @@ class WindowOrientationHost extends StatefulWidget {
     super.key,
     required this.window,
     required this.child,
+    this.allowPhoneLandscape = false,
   });
 
   final WindowService window;
+
+  /// When enabled, phones are no longer locked to portrait while browsing and
+  /// orientation follows the system rotation preference. Fullscreen playback
+  /// keeps its explicit orientation requests.
+  final bool allowPhoneLandscape;
+
   final Widget child;
 
   @override
@@ -34,20 +41,26 @@ class _WindowOrientationHostState extends State<WindowOrientationHost>
   void didChangeDependencies() {
     super.didChangeDependencies();
     _view = View.of(context);
-    _updateDisplay();
+    _applyPolicy();
   }
 
   @override
-  void didChangeMetrics() => _updateDisplay();
+  void didChangeMetrics() => _applyPolicy();
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.resumed) _updateDisplay();
+    if (state == AppLifecycleState.resumed) _applyPolicy();
   }
 
-  void _updateDisplay() {
+  void _applyPolicy() {
     final view = _view;
     if (view == null) return;
+    // Both calls are chained onto WindowService's orientation command queue,
+    // so a settings change and a rotation arriving in the same frame settle
+    // in a deterministic order.
+    unawaited(
+      widget.window.setBrowseLandscapeAllowed(widget.allowPhoneLandscape),
+    );
     final size = WindowSizePolicy.displaySize(view);
     if (size.isEmpty || !size.isFinite) return;
     unawaited(widget.window.updateDisplaySize(size));
@@ -58,8 +71,8 @@ class _WindowOrientationHostState extends State<WindowOrientationHost>
     super.didUpdateWidget(oldWidget);
     if (!identical(oldWidget.window, widget.window)) {
       unawaited(oldWidget.window.clearDisplayOrientationPolicy());
-      _updateDisplay();
     }
+    _applyPolicy();
   }
 
   @override

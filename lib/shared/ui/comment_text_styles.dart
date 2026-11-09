@@ -4,15 +4,18 @@ import 'package:flutter/material.dart';
 final class CommentTextStyles {
   CommentTextStyles(ThemeData theme)
     : _base = theme.textTheme.bodyMedium ?? const TextStyle(),
+      _onSurface = theme.colorScheme.onSurface,
       _dark = theme.brightness == Brightness.dark;
 
   final TextStyle _base;
+  final Color _onSurface;
   final bool _dark;
 
-  Color get _text => _dark ? const Color(0xFFE7E9EB) : const Color(0xFF18191C);
-  Color get _secondary =>
-      _dark ? const Color(0xFFA2A7AE) : const Color(0xFF61666D);
-  Color get _muted => _dark ? const Color(0xFF757A81) : const Color(0xFF9499A0);
+  // Follow the global scheme instead of a separate hard-coded palette so the
+  // comment column stays consistent in both appearances.
+  Color get _text => _onSurface;
+  Color get _secondary => _onSurface.withValues(alpha: _dark ? .68 : .62);
+  Color get _muted => _onSurface.withValues(alpha: _dark ? .5 : .45);
 
   TextStyle get body => _style(15, 25, _text);
   TextStyle get previewBody => _style(14, 20, _text);
@@ -27,7 +30,7 @@ final class CommentTextStyles {
         fontSize: size,
         fontWeight: FontWeight.w400,
         height: lineHeight / size,
-        letterSpacing: 0,
+        letterSpacing: -0.1,
         color: color,
       );
 }

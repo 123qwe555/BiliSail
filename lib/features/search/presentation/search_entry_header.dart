@@ -9,6 +9,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../../shared/ui/bili_icons.dart';
 import '../application/search_discovery_controller.dart';
 import 'search_discovery_panel.dart';
+import '../../../shared/ui/app_layout.dart';
 
 final class SearchEntryHeader extends StatefulWidget {
   const SearchEntryHeader({
@@ -111,7 +112,10 @@ final class _SearchEntryHeaderState extends State<SearchEntryHeader> {
   @override
   Widget build(BuildContext context) => LayoutBuilder(
     builder: (context, constraints) {
-      final mobile = _mobile = constraints.maxWidth < 600;
+      final mobile = _mobile = AppLayout.compactOf(
+        context,
+        extent: constraints.maxWidth,
+      );
       if (mobile && _open) {
         WidgetsBinding.instance.addPostFrameCallback((_) {
           if (mounted) _close();

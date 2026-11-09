@@ -12,6 +12,7 @@ import '../../../domain/playback_mode.dart';
 import '../../../core/input/shortcut_dispatcher.dart';
 import '../../../core/presentation/input_scope.dart';
 import '../../playback/application/playback_session.dart';
+import '../../../shared/ui/app_layout.dart';
 import '../../../shared/ui/playback_page_commands.dart';
 import '../../../shared/ui/playback_layout_builder.dart';
 import '../../../shared/ui/width_layout_builder.dart';
@@ -212,7 +213,7 @@ final class _PgcScreenState extends ConsumerState<PgcScreen> {
       toggleInfo: () => setState(() => _infoVisible = !_infoVisible),
       child: WidthLayoutBuilder(
         builder: (context, width) {
-          final wide = width >= 1000;
+          final wide = AppLayout.playbackSideBySideOf(context, extent: width);
           final showInfo = _infoVisible;
           void toggleInfo() => setState(() => _infoVisible = !_infoVisible);
           final info = Material(

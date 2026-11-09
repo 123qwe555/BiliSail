@@ -53,6 +53,10 @@ final class WorkspaceTab {
 final class WorkspaceTabs {
   static const maximumTabs = 16;
   static const maximumHistory = 64;
+
+  /// Retained playback pages. Each one holds a native player and an open
+  /// stream, so this cap is deliberately much lower than [maximumTabs].
+  static const maximumPlaybackPages = 6;
   final List<WorkspaceTab> _tabs = [
     WorkspaceTab(
       id: 'home',
@@ -479,5 +483,32 @@ final class WorkspaceTabs {
     }
     _trimHistory();
     return true;
+  }
+
+  /// Closes the least recently visited playback pages once more than [maximum]
+  /// are retained.
+  ///
+  /// Playback pages are much heavier than browsing pages: each one owns a
+  /// native player, its own stream and its own decode pipeline, and keeping
+  /// them all alive is what makes a long chain of video opens feel like the
+  /// network is struggling. Browsing pages are left alone — they are cheap and
+  /// the user expects to come back to them.
+  ///
+  /// Returns true when at least one page was closed.
+  bool enforcePlaybackLimit({int maximum = maximumPlaybackPages}) {
+    var pages = _tabs.where((tab) => tab.isPlayback).length;
+    if (pages <= maximum || maximum < 1) return false;
+    var closed = false;
+    // _playbackVisits is maintained in visit order, oldest first.
+    for (final id in [..._playbackVisits]) {
+      if (pages <= maximum) break;
+      if (id == _activeId || id == _playbackId) continue;
+      final tab = _tabs.where((tab) => tab.id == id).firstOrNull;
+      if (tab == null || !tab.isPlayback) continue;
+      if (!close(id)) continue;
+      closed = true;
+      pages = _tabs.where((tab) => tab.isPlayback).length;
+    }
+    return closed;
   }
 }
