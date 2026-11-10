@@ -11,6 +11,7 @@
 
 <p align="center">
   <a href="pubspec.yaml"><img src="https://img.shields.io/badge/dynamic/yaml?url=https%3A%2F%2Fraw.githubusercontent.com%2F123qwe555%2FBiliSail%2Fmain%2Fpubspec.yaml&amp;query=%24.version&amp;label=version&amp;color=fb7299" alt="源码版本（pubspec.yaml）"></a>
+  <a href="https://github.com/123qwe555/BiliSail/releases"><img src="https://img.shields.io/github/v/release/123qwe555/BiliSail?label=release&amp;color=fb7299" alt="最新 Release"></a>
   <a href="pubspec.yaml"><img src="https://img.shields.io/badge/Flutter-3.47.6-02569B?logo=flutter&amp;logoColor=white" alt="Flutter 3.47.6"></a>
   <a href="https://dart.dev"><img src="https://img.shields.io/badge/Dart-3.13.5-0175C2?logo=dart&amp;logoColor=white" alt="Dart 3.13.5"></a>
   <a href="#许可与第三方资源"><img src="https://img.shields.io/badge/license-unlicensed-lightgrey" alt="许可证未确定"></a>
@@ -111,7 +112,7 @@ BiliSail（哔帆）以视频、影视和直播观看为核心，提供双／多
 
 | 平台 | 目标架构 / 系统 | 本仓库的验证状态 |
 | --- | --- | --- |
-| Android | arm64 / Android 7.0（API 24）及以上 | **主要验证平台**：本地 release 构建、固定签名与单 arm64 ABI 校验通过；视频／影视／直播播放、卡片与全屏转场、自动全屏、离线下载均在真机上跑过 |
+| Android | arm64 / Android 7.0（API 24）及以上 | **主要验证平台**：本地 release 构建与单 arm64 ABI 校验通过，Release 提供可安装的测试包；视频／影视／直播播放、卡片与全屏转场、自动全屏、离线下载均在真机上跑过 |
 | Windows | x64 / Windows 10 1809 及以上 | 沿用上游工程与打包脚本，本仓库未复验；构建命令见[从源码运行](#从源码运行) |
 | Windows ARM64 | ARM64 / Windows 11 及以上 | 沿用上游的独立构建目标，本仓库未复验 |
 | macOS | arm64、Intel x64 / macOS 13.0 及以上 | 沿用上游工程；需在 macOS 主机上构建，本仓库未复验 |
@@ -122,18 +123,26 @@ BiliSail（哔帆）以视频、影视和直播观看为核心，提供双／多
 
 ## 下载与安装
 
-本仓库**不发布安装包**，也没有 Release；包体与签名由你按[从源码运行](#从源码运行)自行构建。
+Android 安装包发布在 [Releases](https://github.com/123qwe555/BiliSail/releases)：
 
-如需现成安装包，可使用[上游 Releases](https://github.com/CKopoer/BiliSail/releases)——那是上游版本，**不包含本仓库的界面与转场改动**。
+| 安装包 | 适用平台 | 说明 |
+| --- | --- | --- |
+| `BiliSail-<版本>-arm64-release.apk` | Android 7.0（API 24）及以上，arm64-v8a | 开发版包名 `dev.bilisail.bilisail.test`，可与上游正式包共存；使用 Debug 证书签名，**不能覆盖上游正式签名的同名应用** |
 
-自建 Android 安装包后，可直接安装到已连接的设备（`dev.bilisail.bilisail.test` 为开发版包名，与上游正式包可共存）：
+下载后先核对 Release 说明里给出的 SHA-256，再安装到已连接的设备：
 
 ```powershell
-.\tool\build-android-development.ps1 -Mode Release -SkipMuxBuild
-adb install -r .\build\development\android-arm64\BiliSail-test-arm64-release.apk
+adb install -r .\BiliSail-<版本>-arm64-release.apk
 ```
 
-固定 release 签名与覆盖升级的边界见 [Android 签名](docs/validation/ci-cd.md#android-固定签名与覆盖升级)。
+其它架构或自定义签名仍可按[从源码运行](#从源码运行)自建：
+
+```powershell
+# 产物：build\development\android-arm64\BiliSail-test-arm64-release.apk
+.\tool\build-android-development.ps1 -Mode Release -SkipMuxBuild
+```
+
+固定 release 签名与覆盖升级的边界见 [Android 签名](docs/validation/ci-cd.md#android-固定签名与覆盖升级)。上游的现成安装包见[上游 Releases](https://github.com/CKopoer/BiliSail/releases)，但**不包含本仓库的界面与转场改动**。
 
 ## 从源码运行
 
@@ -181,7 +190,7 @@ flutter build windows --release
 
 ## 使用说明
 
-设置“关于”提供项目 GitHub 地址和“检查更新”。每天首次打开应用时会自动检查已发布版本（包含预览版）；发现新版本后弹窗提示，点击“前往 Release”可查看说明并下载。自动检查失败时保持安静，可随时手动重试；应用不会自动下载或安装更新。本仓库没有 Release，检查更新会指向无内容，介意可在“关于”中关闭预发布检查。
+设置“关于”提供项目 GitHub 地址和“检查更新”。每天首次打开应用时会自动检查已发布版本（包含预览版）；发现新版本后弹窗提示，点击“前往 Release”可查看说明并下载。自动检查失败时保持安静，可随时手动重试；应用不会自动下载或安装更新。检查更新以仓库最新 Release 为准，可在“关于”中关闭预发布检查。
 
 桌面工作区支持固定根页面，以及搜索、视频、影视、直播播放、用户和历史等标签。根标签固定，最多打开 16 个标签；标签状态保留至本次运行结束。每个播放标签拥有独立播放器，切换到普通页面时媒体继续播放；是否允许不同播放标签同时播放由下方设置控制。关闭播放标签只停止并释放该标签的播放器。**同时保留的播放页最多 6 个**：超出的按最久未访问顺序关闭，当前页与浏览页不会被淘汰，所以连续点开多个视频后旧播放页会自动回收。
 
@@ -294,6 +303,7 @@ Pop-Location
 | 文档 | 内容 |
 | --- | --- |
 | [文档索引](docs/README.md) | 全部设计与功能验证记录 |
+| [更新日志](CHANGELOG.md) | 各版本改动明细与安装包说明 |
 | [整体架构](docs/architecture.md) | 功能分层、独立包、状态与生命周期 |
 | [API 与会话](docs/api-design.md) | 接口、鉴权、错误处理与账号隔离 |
 | [播放、直播与弹幕](docs/playback-and-danmaku.md) | 播放会话、媒体请求与弹幕时钟 |
