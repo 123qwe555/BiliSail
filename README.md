@@ -369,8 +369,8 @@ Pop-Location
 
 ## 许可与第三方资源
 
-本项目尚未确定开源许可证。第三方依赖与素材保留各自许可和权利范围，公开源码不代表所有资源均已取得再分发授权。
+本项目当前为 **All Rights Reserved（保留所有权利）**，未采用开源许可证，条款见 [LICENSE](LICENSE)。第三方依赖与素材保留各自许可和权利范围，公开源码不代表所有资源均已取得再分发授权。
 
 部分参考图标目前仅记录了本机预览的采用范围，对外发行前仍需核实；原生播放器及其子依赖的许可材料也需单独归档。详见[第三方来源与分发检查](THIRD_PARTY_NOTICES.md)及[资源来源](assets/README.md)。
 
-本项目基于上游 [BiliSail](https://github.com/CKopoer/BiliSail) 修改，上游同样未声明开源许可证；再分发前请先与上游确认授权范围。
+本项目基于上游 [BiliSail](https://github.com/CKopoer/BiliSail) 修改，上游同样未声明开源许可证；再分发前请先与上游确认授权范围。仓库地址：<https://github.com/123qwe555/BiliSail>，问题反馈与讨论请在本仓库的 [Issues](https://github.com/123qwe555/BiliSail/issues) 进行。
