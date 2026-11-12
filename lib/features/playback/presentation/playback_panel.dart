@@ -90,6 +90,14 @@ class _PlaybackPanelState extends ConsumerState<PlaybackPanel>
   final _navigation = ValueNotifier<PlaybackNavigation?>(null);
   final _danmakuDraft = TextEditingController();
   int? _handledCompletionGeneration;
+
+  /// The source whose completion check is in flight, so a burst of snapshots
+  /// cannot schedule the same advance twice while it waits to settle.
+  int? _completionCheckGeneration;
+
+  /// How many frames a completion check may wait for a transient state
+  /// (resolving, surface remounting, page commands not published) to clear.
+  static const int _completionRetryFrames = 4;
   // Inline and fullscreen views are recreated, but share the page's intent.
   late final ValueNotifier<bool> _controlsVisible;
   final _fullScreenExitCover = ValueNotifier(false);
@@ -101,6 +109,11 @@ class _PlaybackPanelState extends ConsumerState<PlaybackPanel>
   /// One automatic fullscreen per page: leaving it by hand must not be undone
   /// by the next activation, and coming back to the page must not re-enter.
   bool _autoFullScreenHandled = false;
+
+  /// Autoplay after the open flight is a convenience, not a guarantee: when the
+  /// engine refuses to start, the surface stays paused and this hint is shown
+  /// exactly once per page so a later manual play never nags again.
+  bool _autoplayHintShown = false;
   bool _systemPip = false;
   OverlayEntry? _miniOverlay;
   Object? _miniRequest;
@@ -268,6 +281,9 @@ class _PlaybackPanelState extends ConsumerState<PlaybackPanel>
       title: widget.title,
       visible: _active,
       desiredPlaying: gate == null ? null : false,
+      // The source is opened paused only to wait for the flight. Marking it as
+      // deferred keeps that paused phase from looking like a user pause.
+      deferStart: gate != null,
     );
     if (gate == null) return;
     await gate;
@@ -278,15 +294,78 @@ class _PlaybackPanelState extends ConsumerState<PlaybackPanel>
       return;
     }
     // The gate only delays the start: it never overrules the user's autoplay
-    // choice, nor resumes something they paused or that already ended.
+    // choice, nor resumes something they paused or that already ended. Volume
+    // and rate were already restored by `activate` before the gate resolved,
+    // so the first audible frame matches the saved preferences.
     if (!_settings.value.autoPlay) return;
     final phase = _session.snapshots.value.phase;
-    if (phase == PlaybackPhase.playing ||
-        phase == PlaybackPhase.paused ||
-        phase == PlaybackPhase.ended) {
+    if (phase == PlaybackPhase.playing || phase == PlaybackPhase.ended) {
       return;
     }
-    unawaited(_session.play());
+    // A paused phase right after the landing is the deferred start this very
+    // activation asked for, not a pause the user made: the media is often
+    // ready before the animation ends, and treating that as "already paused"
+    // is what made the "自动播放" switch look broken.
+    if (phase == PlaybackPhase.paused && !_session.startDeferred) return;
+    await _startAfterLanding(activityRequest);
+  }
+
+  /// Starts playback once the open flight has landed.
+  ///
+  /// A failed start must never surface as an unhandled async error: the page is
+  /// still usable, the surface keeps the paused frame, and tapping it plays.
+  /// The session already turns engine failures into a visible error banner, so
+  /// this only adds one quiet hint when the source ends up paused without one.
+  Future<void> _startAfterLanding(Object activityRequest) async {
+    try {
+      await _session.play();
+    } catch (error, stack) {
+      FlutterError.reportError(
+        FlutterErrorDetails(
+          exception: error,
+          stack: stack,
+          library: 'bilisail.playback',
+          context: ErrorDescription('autoplay after the open flight'),
+        ),
+      );
+      if (_stillOwning(activityRequest)) _showAutoplayHint();
+      return;
+    }
+    if (!_stillOwning(activityRequest)) return;
+    // The engine needs a moment to leave `paused` for buffering/playing, so
+    // only an unexplained pause that survives the grace period is worth a
+    // hint. Otherwise a normal start would nag the user for nothing.
+    if (_session.isResolving ||
+        _session.error != null ||
+        _session.snapshots.value.phase != PlaybackPhase.paused) {
+      return;
+    }
+    await Future<void>.delayed(const Duration(milliseconds: 400));
+    if (!_stillOwning(activityRequest)) return;
+    if (_session.error == null &&
+        !_session.isResolving &&
+        _session.snapshots.value.phase == PlaybackPhase.paused) {
+      _showAutoplayHint();
+    }
+  }
+
+  /// True while this page still owns the landed flight and its playback.
+  bool _stillOwning(Object activityRequest) =>
+      mounted &&
+      _active &&
+      identical(_activityRequest, activityRequest) &&
+      _session.ownsPlayback(this);
+
+  /// One non-blocking hint per page; stays silent when no notice host exists
+  /// (for example in a bare widget test).
+  void _showAutoplayHint() {
+    if (_autoplayHintShown || !mounted) return;
+    _autoplayHintShown = true;
+    try {
+      showAppNotice(context, '动画结束后未能自动播放，点按画面即可开始');
+    } on FlutterError {
+      // No AppNoticeHost ancestor: honour the "silent" half of the contract.
+    }
   }
 
   /// Honours "打开视频后自动全屏" the first time this page becomes active.
@@ -324,46 +403,90 @@ class _PlaybackPanelState extends ConsumerState<PlaybackPanel>
     }
     final generation = _session.sourceGeneration;
     if (snapshot.phase != PlaybackPhase.ended ||
-        _handledCompletionGeneration == generation ||
-        _session.isResolving ||
-        _session.media == null) {
+        _handledCompletionGeneration == generation) {
       return;
     }
-    _handledCompletionGeneration = generation;
-    scheduleMicrotask(() {
-      final commands = _pageCommands.value;
-      if (!mounted ||
-          !_session.canAutoAdvance ||
-          !_session.ownsPlayback(this) ||
-          _session.isLive ||
-          _session.sourceGeneration != generation ||
-          _session.snapshots.value.phase != PlaybackPhase.ended ||
-          _session.detail?.summary.id != widget.detail?.summary.id ||
-          _session.part?.cid != widget.part?.cid ||
-          _session.contentTarget != widget.target) {
+    // `ended` is published exactly once per source, and no later snapshot will
+    // repeat it. A guard that happens to be false at this instant (a resolve
+    // still finishing, the page commands not published yet, the surface
+    // remounting) must therefore not consume the event, or the episode loses
+    // its finish line and the queue never advances to the next one.
+    if (_completionCheckGeneration == generation) return;
+    _completionCheckGeneration = generation;
+    _scheduleCompletionCheck(generation);
+  }
+
+  void _scheduleCompletionCheck(int generation, [int attempt = 0]) {
+    scheduleMicrotask(() => _checkCompletion(generation, attempt));
+  }
+
+  void _checkCompletion(int generation, int attempt) {
+    if (!mounted ||
+        _handledCompletionGeneration == generation ||
+        _session.sourceGeneration != generation ||
+        _session.snapshots.value.phase != PlaybackPhase.ended) {
+      _clearCompletionCheck(generation);
+      return;
+    }
+    // Retry a bounded number of frames while the end is only provisionally
+    // observable; everything below is a definitive decision.
+    //
+    // Missing page commands are *not* transient: a standalone or offline
+    // player has none for good, and waiting for them would strand the loop
+    // modes. The switch below copes with absent commands on its own.
+    final pending = _session.isResolving || _session.media == null;
+    if (pending) {
+      if (attempt >= _completionRetryFrames) {
+        _clearCompletionCheck(generation);
         return;
       }
-      switch (widget.settings.playbackMode) {
-        case PlaybackMode.pause:
-          break;
-        case PlaybackMode.continuous:
-          if (commands?.hasNext == true) {
-            if (widget.settings.continuousPlayback) {
-              commands?.onCompleted?.call();
-            }
-          } else if (widget.settings.continuousRelatedPlayback) {
-            commands?.onRelatedCompleted?.call();
+      WidgetsBinding.instance.addPostFrameCallback(
+        (_) => _scheduleCompletionCheck(generation, attempt + 1),
+      );
+      return;
+    }
+    _clearCompletionCheck(generation);
+    if (!_session.canAutoAdvance ||
+        !_session.ownsPlayback(this) ||
+        _session.isLive ||
+        _session.detail?.summary.id != widget.detail?.summary.id ||
+        _session.part?.cid != widget.part?.cid ||
+        _session.contentTarget != widget.target) {
+      return;
+    }
+    final commands = _pageCommands.value;
+    final mode = widget.settings.playbackMode;
+    // A source that ended in single-item mode has nothing to continue with;
+    // leaving it unreserved lets a later settings change still revive it.
+    if (mode == PlaybackMode.pause) return;
+    // Reserve the generation only once an action is actually dispatched.
+    _handledCompletionGeneration = generation;
+    switch (mode) {
+      case PlaybackMode.pause:
+        break;
+      case PlaybackMode.continuous:
+        if (commands?.hasNext == true) {
+          if (widget.settings.continuousPlayback) {
+            commands?.onCompleted?.call();
           }
-        case PlaybackMode.listLoop:
-          if (commands?.onLoopCompleted case final loop?) {
-            loop();
-          } else {
-            unawaited(_session.repeatCompleted(generation));
-          }
-        case PlaybackMode.singleLoop:
+        } else if (widget.settings.continuousRelatedPlayback) {
+          commands?.onRelatedCompleted?.call();
+        }
+      case PlaybackMode.listLoop:
+        if (commands?.onLoopCompleted case final loop?) {
+          loop();
+        } else {
           unawaited(_session.repeatCompleted(generation));
-      }
-    });
+        }
+      case PlaybackMode.singleLoop:
+        unawaited(_session.repeatCompleted(generation));
+    }
+  }
+
+  void _clearCompletionCheck(int generation) {
+    if (_completionCheckGeneration == generation) {
+      _completionCheckGeneration = null;
+    }
   }
 
   @override
@@ -426,6 +549,7 @@ class _PlaybackPanelState extends ConsumerState<PlaybackPanel>
 
   @override
   void dispose() {
+    _pipExitTimer?.cancel();
     PictureInPictureService.instance.active.removeListener(_pipChanged);
     _dismissMiniPlayer();
     if (widget.window.onMiniPlayerRequested == _requestMiniPlayer) {

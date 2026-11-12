@@ -7,7 +7,7 @@ body:
     attributes:
       value: |
         欢迎帮助完善说明与文案，可使用中文或 English。
-        请先搜索[已有 issue（含已关闭）](https://github.com/CKopoer/BiliSail/issues?q=is%3Aissue)；已有相同反馈时可以在原 issue 补充。
+        请先搜索[已有 issue（含已关闭）](https://github.com/123qwe555/BiliSail/issues?q=is%3Aissue)；已有相同反馈时可以在原 issue 补充。
 
   - type: input
     id: location

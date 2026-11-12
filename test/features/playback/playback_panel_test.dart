@@ -32,6 +32,7 @@ import 'package:bilisail/shared/ui/playback_page_commands.dart';
 import 'package:bilisail/shared/ui/playback_navigation.dart';
 import 'package:bilisail/shared/ui/playback_info_tabs.dart';
 import 'package:bilisail/shared/ui/playback_sidebar_toggle.dart';
+import 'package:bilisail/shared/ui/video_open_transition.dart';
 import 'package:bilisail/features/playback/application/playback_viewers_controller.dart';
 import 'package:bilisail/core/platform/window_service.dart';
 import 'package:bilisail/domain/request_cancellation.dart';
@@ -2211,6 +2212,59 @@ void main() {
     await tester.pumpWidget(const SizedBox());
     await _pumpFrames(tester);
   });
+
+  testWidgets(
+    'autoplay starts once the flight lands even when the media is ready first',
+    (tester) async {
+      final engine = _FakeEngine()..pausedOnOpen = true;
+      final session = _session(engine);
+      addTearDown(session.close);
+      addTearDown(VideoOpenGate.abandon);
+      // The card flight is armed before the page activates, exactly like a
+      // tap on a cover in the grid.
+      VideoOpenGate.beginCardFlight();
+      await tester.pumpWidget(
+        _app(session, _FakeWindowService(), const AppSettings.defaults()),
+      );
+      await _pumpFrames(tester);
+      // The source waits for the flight: open, ready, and paused on purpose.
+      expect(engine.currentSnapshot.phase, PlaybackPhase.paused);
+      expect(engine.currentSnapshot.desiredPlaying, isFalse);
+      VideoOpenGate.releaseCardFlight();
+      await _pumpFrames(tester);
+      // "自动播放" is on, so the landing must start the picture even though
+      // the source was already sitting on a paused frame.
+      expect(engine.currentSnapshot.desiredPlaying, isTrue);
+      expect(engine.currentSnapshot.phase, PlaybackPhase.playing);
+      await tester.pumpWidget(const SizedBox());
+      await _pumpFrames(tester);
+    },
+  );
+
+  testWidgets(
+    'autoplay stays off when the switch is off, even with a deferred start',
+    (tester) async {
+      final engine = _FakeEngine()..pausedOnOpen = true;
+      final session = _session(engine);
+      addTearDown(session.close);
+      addTearDown(VideoOpenGate.abandon);
+      VideoOpenGate.beginCardFlight();
+      await tester.pumpWidget(
+        _app(
+          session,
+          _FakeWindowService(),
+          const AppSettings.defaults().copyWith(autoPlay: false),
+        ),
+      );
+      await _pumpFrames(tester);
+      VideoOpenGate.releaseCardFlight();
+      await _pumpFrames(tester);
+      expect(engine.currentSnapshot.desiredPlaying, isFalse);
+      expect(engine.currentSnapshot.phase, PlaybackPhase.paused);
+      await tester.pumpWidget(const SizedBox());
+      await _pumpFrames(tester);
+    },
+  );
 
   for (final fullscreen in [false, true]) {
     for (final controlsVisible in [true, false]) {
@@ -10730,6 +10784,12 @@ final class _FakeEngine implements PlayerEngine, VideoOutputSource {
   Completer<void>? nextSeek;
   Completer<void>? nextPlay;
   Completer<void>? nextOpen;
+
+  /// Mirrors a real engine, which reports `paused` when it is opened without
+  /// playing. Tests that depend on that shape (for example a source that is
+  /// ready before the open transition lands) can ask for it.
+  bool pausedOnOpen = false;
+
   final frameReady = ValueNotifier(true);
 
   @override
@@ -10758,7 +10818,7 @@ final class _FakeEngine implements PlayerEngine, VideoOutputSource {
     }
     _emit(
       PlaybackSnapshot(
-        phase: PlaybackPhase.ready,
+        phase: pausedOnOpen ? PlaybackPhase.paused : PlaybackPhase.ready,
         generation: opens,
         position: options.startPosition,
         duration: const Duration(minutes: 3),

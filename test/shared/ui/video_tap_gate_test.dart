@@ -13,21 +13,28 @@ void main() {
   });
 
   test('the first tap opens and an immediate repeat is swallowed', () {
-    expect(VideoTapGate.shouldOpen(), isTrue);
-    expect(VideoTapGate.shouldOpen(), isFalse);
-    expect(VideoTapGate.shouldOpen(), isFalse);
+    expect(VideoTapGate.shouldOpen('a'), isTrue);
+    expect(VideoTapGate.shouldOpen('a'), isFalse);
+    expect(VideoTapGate.shouldOpen('a'), isFalse);
+  });
+
+  test('a different card is not blocked by the previous one', () {
+    expect(VideoTapGate.shouldOpen('a'), isTrue);
+    expect(VideoTapGate.shouldOpen('b'), isTrue);
+    expect(VideoTapGate.shouldOpen('b'), isFalse);
+    expect(VideoTapGate.shouldOpen('a'), isTrue);
   });
 
   test('the window reopens after a reset', () {
-    expect(VideoTapGate.shouldOpen(), isTrue);
-    expect(VideoTapGate.shouldOpen(), isFalse);
+    expect(VideoTapGate.shouldOpen('a'), isTrue);
+    expect(VideoTapGate.shouldOpen('a'), isFalse);
     VideoTapGate.reset();
-    expect(VideoTapGate.shouldOpen(), isTrue);
+    expect(VideoTapGate.shouldOpen('a'), isTrue);
   });
 
   test('a disabled gate lets every tap through', () {
     VideoTapGate.enabled = false;
-    expect(VideoTapGate.shouldOpen(), isTrue);
-    expect(VideoTapGate.shouldOpen(), isTrue);
+    expect(VideoTapGate.shouldOpen('a'), isTrue);
+    expect(VideoTapGate.shouldOpen('a'), isTrue);
   });
 }

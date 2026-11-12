@@ -54,3 +54,23 @@ app.*.map.json
 /artifacts/
 
 promo-video/
+
+# Local secrets and signing material (never commit)
+*.jks
+*.keystore
+*.p12
+*.pfx
+key.properties
+*.key.json
+.env
+.env.*
+
+# Built binaries are distributed via GitHub Releases, not committed to source.
+# Build outputs under /build and **/build are already ignored above.
+*.apk
+*.aab
+*.ipa
+*.msix
+*.appimage
+*.flatpak
+*.symbols.zip

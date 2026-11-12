@@ -39,8 +39,10 @@ final class PlaybackManager extends ChangeNotifier {
     if (_closed) throw StateError('PlaybackManager is closed');
     return _sessions.putIfAbsent(tabId, () {
       final session = _createSession();
-      if (!_allowConcurrent) {
+      if (!_allowConcurrent && _activeTabId != tabId) {
         // Block autoplay immediately, including sources still being resolved.
+        // The active tab keeps its permission: blocking it would refuse the
+        // automatic start that follows the open transition.
         unawaited(session.setPlaybackAllowed(false));
       }
       scheduleMicrotask(() {

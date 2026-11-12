@@ -331,6 +331,19 @@ class PlaybackSession extends ChangeNotifier {
   bool _closing = false;
   bool _resolving = false;
   bool _desiredPlaying = true;
+
+  /// True while the current source was opened paused on purpose, waiting for
+  /// the open transition to land.
+  ///
+  /// A deferred start is *not* a user pause: the picture is still black and the
+  /// surface has not been shown yet, so a paused phase here means "not started
+  /// yet". Without this distinction the automatic start after the transition
+  /// is skipped whenever the media happens to be ready before the animation
+  /// ends, and the "自动播放" switch looks broken.
+  bool _startDeferred = false;
+
+  /// Whether the current source is waiting for the open transition to land.
+  bool get startDeferred => _startDeferred;
   ({
     VideoId id,
     String? cid,
@@ -641,7 +654,9 @@ class PlaybackSession extends ChangeNotifier {
       quality: _quality,
       liveLine: _liveLine,
       liveStream: _liveStreamPreference,
-      desiredPlaying: _desiredPlaying,
+      // A deferred start is not an intent of its own. Recording it as "do not
+      // play" would keep the next source silent even with "自动播放" on.
+      desiredPlaying: _startDeferred ? null : _desiredPlaying,
       subtitleLabel: _subtitlePreference,
       voice: _voice,
       audioQuality: _audioQuality,
@@ -671,6 +686,11 @@ class PlaybackSession extends ChangeNotifier {
     /// without starting it, so a transition can finish first; null keeps the
     /// usual restore-or-autoplay rules.
     bool? desiredPlaying,
+
+    /// Marks this open as waiting for the open transition to land. The paused
+    /// phase of such a source is a deferred start, not a user pause, so it is
+    /// neither remembered as an intent nor used to skip the automatic start.
+    bool deferStart = false,
   }) async {
     if (_disposed || !_owners.contains(owner)) return;
     if (identical(_activeOwner, owner) &&
@@ -748,7 +768,9 @@ class PlaybackSession extends ChangeNotifier {
           desiredPlaying ??
           nextPlaying ??
           restored?.desiredPlaying ??
-          (sameOwner ? _desiredPlaying : _settings.autoPlay),
+          // A deferred start never turned into an intent of its own: it must
+          // not shadow the "自动播放" switch for the next source.
+          (sameOwner && !_startDeferred ? _desiredPlaying : _settings.autoPlay),
       rate:
           restored?.rate ?? _rateMemory.rateFor(_settings.defaultPlaybackRate),
       volume:
@@ -761,6 +783,7 @@ class PlaybackSession extends ChangeNotifier {
           ? _foregroundAudioOnly
           : restored?.audioOnly ??
                 (sameOwner && sameKind && _foregroundAudioOnly),
+      startDeferred: deferStart,
     );
   }
 
@@ -863,6 +886,10 @@ class PlaybackSession extends ChangeNotifier {
     int? liveLine,
     LiveStreamPreference? liveStream,
     bool? audioOnly,
+
+    /// Marks a source that is opened paused only to wait for the open
+    /// transition, so the paused phase is not mistaken for a user pause.
+    bool startDeferred = false,
   }) => _open(
     video,
     selected,
@@ -879,6 +906,7 @@ class PlaybackSession extends ChangeNotifier {
     liveLine: liveLine,
     liveStream: liveStream,
     audioOnly: audioOnly,
+    startDeferred: startDeferred,
   );
 
   Future<void> _open(
@@ -899,6 +927,7 @@ class PlaybackSession extends ChangeNotifier {
     bool? audioOnly,
     bool allowColorFallback = true,
     Duration? startupBudget,
+    bool startDeferred = false,
   }) async {
     if (_disposed || _closing) return;
     if (target == null && (video == null || selected == null)) return;
@@ -984,6 +1013,9 @@ class PlaybackSession extends ChangeNotifier {
         ? voice ?? (samePart ? _voice : const PlaybackVoice.original())
         : const PlaybackVoice.original();
     if (!samePart) _voices = const [];
+    // A deferred start is a paused source waiting for the open transition; it
+    // must never be read back as "the user paused it".
+    _startDeferred = startDeferred && desiredPlaying != true;
     if (desiredPlaying != null) {
       _desiredPlaying = desiredPlaying;
     } else if (!samePart) {
@@ -1512,6 +1544,10 @@ class PlaybackSession extends ChangeNotifier {
     }
     if (enteredEnded && !_resolving) {
       _desiredPlaying = false;
+    }
+    // The source is really running now: the deferred start has been consumed.
+    if (value.phase == PlaybackPhase.playing) {
+      _startDeferred = false;
     }
     if (_ownerVisible &&
         commentsEnabled &&
@@ -2464,6 +2500,9 @@ class PlaybackSession extends ChangeNotifier {
     if (_disposed || _closing) return;
     sleepTimer.checkDeadline();
     sleepTimer.acknowledgeElapsed();
+    // An explicit start ends the deferred window: from now on a paused phase
+    // means the user paused it.
+    _startDeferred = false;
     if (error != null && !_resolving) {
       _desiredPlaying = true;
       await retry();
@@ -2485,6 +2524,8 @@ class PlaybackSession extends ChangeNotifier {
   Future<void> pause() async {
     _automaticRepeat = null;
     _desiredPlaying = false;
+    // The user paused it: this is a real intent and must survive the next open.
+    _startDeferred = false;
     _cancelRecovery();
     _notify();
     await _command(() => _syncPlayback(forcePause: true));
@@ -3158,7 +3199,11 @@ final class _PlaybackCheckpoint {
   final int quality;
   final int liveLine;
   final LiveStreamPreference liveStream;
-  final bool desiredPlaying;
+
+  /// Null means "no intent was recorded" — the source was opened paused only
+  /// to wait for the open transition, so the next source must not inherit a
+  /// "do not play" that the user never expressed.
+  final bool? desiredPlaying;
   final String? subtitleLabel;
   final PlaybackVoice voice;
   final AudioQualityPreference? audioQuality;

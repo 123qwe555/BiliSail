@@ -7,14 +7,14 @@ body:
     attributes:
       value: |
         感谢帮助改进 BiliSail（哔帆）！每个 issue 请只描述一个问题，可使用中文或 English。
-        建议先查看[使用说明](https://github.com/CKopoer/BiliSail#使用说明)和[最新发布版本](https://github.com/CKopoer/BiliSail/releases)。无法更新或仅旧版本出现的问题也可以反馈，请注明情况。
+        建议先查看[使用说明](https://github.com/123qwe555/BiliSail#使用说明)和[最新发布版本](https://github.com/123qwe555/BiliSail/releases)。无法更新或仅旧版本出现的问题也可以反馈，请注明情况。
         **Issue 公开可见。请勿上传 Cookie、Token、登录二维码、手机号、私信内容或带签名参数的播放／下载地址；截图和日志请先检查、打码。**
 
   - type: checkboxes
     id: checklist
     attributes:
       label: 提交前确认
-      description: 请先搜索[已有 issue（含已关闭）](https://github.com/CKopoer/BiliSail/issues?q=is%3Aissue)。
+      description: 请先搜索[已有 issue（含已关闭）](https://github.com/123qwe555/BiliSail/issues?q=is%3Aissue)。
       options:
         - label: 我已搜索已有 issue，未发现相同问题；如有相关记录，会在下方附上链接。
           required: true

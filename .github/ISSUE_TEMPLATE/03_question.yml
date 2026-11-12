@@ -6,7 +6,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        请先查看[下载与安装](https://github.com/CKopoer/BiliSail#下载与安装)、[使用说明](https://github.com/CKopoer/BiliSail#使用说明)及[已有 issue](https://github.com/CKopoer/BiliSail/issues?q=is%3Aissue)。
+        请先查看[下载与安装](https://github.com/123qwe555/BiliSail#下载与安装)、[使用说明](https://github.com/123qwe555/BiliSail#使用说明)及[已有 issue](https://github.com/123qwe555/BiliSail/issues?q=is%3Aissue)。
         已能明确复现的功能异常建议使用「问题反馈」；不确定时也可以在这里描述，可使用中文或 English。
         **Issue 公开可见，请勿提供 Cookie、Token、登录二维码、手机号、私信或带签名参数的播放／下载地址。**
 

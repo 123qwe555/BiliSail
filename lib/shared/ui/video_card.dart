@@ -316,9 +316,12 @@ final class _VideoCardState extends State<VideoCard> {
           child: InkWell(
             onTap: widget.feedback == null
                 ? () {
-                    // Ignore repeat taps: a second page would stack another
-                    // playback session on top of one that is still resolving.
-                    if (!VideoTapGate.shouldOpen()) return;
+                    // Ignore repeat taps on the same card: a second page would
+                    // stack another playback session on top of one that is
+                    // still resolving. A different card opens right away.
+                    if (!VideoTapGate.shouldOpen(widget.video.id.value)) {
+                      return;
+                    }
                     _recordOpenOrigin();
                     widget.onTap();
                   }

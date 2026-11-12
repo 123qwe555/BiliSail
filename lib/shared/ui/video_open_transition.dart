@@ -442,9 +442,10 @@ final class _VideoOpenPopState extends State<VideoOpenPop>
     // tap, so the reverse flight still has a starting rectangle.
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _measure();
-      // Opened without a card (deep link, retained page): no flight is coming,
-      // so playback must not wait for one.
-      if (_from == null) VideoOpenGate.releaseCardFlight();
+      // Opened without a card (deep link, retained page). Do *not* release the
+      // gate here: another playback page may own the flight that is running
+      // right now, and releasing it would start playback under the animation.
+      // A gate nobody owns is released by the watchdog.
     });
   }
 
